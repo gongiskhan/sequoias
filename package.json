@@ -1,0 +1,50 @@
+{
+  "name": "sequoias",
+  "version": "0.1.0",
+  "description": "Local desktop dashboard for managing parallel Claude Code sessions across git worktrees",
+  "type": "module",
+  "bin": {
+    "sequoias": "dist/server/cli.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/fix-pty-helper.cjs",
+    "build": "npm run build:ui && npm run build:server",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:ui": "vite build",
+    "dev": "concurrently \"npm:dev:server\" \"npm:dev:ui\"",
+    "dev:server": "tsc -p tsconfig.server.json --watch",
+    "dev:ui": "vite",
+    "start": "node dist/server/cli.js",
+    "test": "node --test --import tsx tests/unit/*.test.ts",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "execa": "^9.5.2",
+    "express": "^4.21.2",
+    "ignore": "^7.0.3",
+    "node-pty": "^1.0.0",
+    "simple-git": "^3.27.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.1",
+    "@types/express": "^5.0.0",
+    "@types/node": "^20.17.10",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@types/ws": "^8.5.13",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "lucide-react": "^0.469.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "@xterm/xterm": "^5.5.0",
+    "@xterm/addon-fit": "^0.10.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

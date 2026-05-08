@@ -1,0 +1,17 @@
+{
+  "_comment": "Project-local Claude Code settings for Sequoias. Stop hook nudges agents to keep HISTORY.md in sync. The hook script is non-blocking — it only emits a reminder when HISTORY.md hasn't been touched in the freshness window (default 15m).",
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/history-reminder.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
