@@ -123,6 +123,41 @@ export function serviceForKey(key: string): string {
   return key.toLowerCase();
 }
 
+// Map a package subdirectory to a port from the allocated set, using common
+// monorepo conventions. Many services (cortex, express, fastify) read
+// process.env.PORT directly with a hardcoded default — without this mapping,
+// every worktree would collide on that default. Returns undefined if no
+// reasonable match is found.
+const DIR_PORT_ALIASES: Record<string, string[]> = {
+  cortex: ['cortex', 'api', 'backend', 'server'],
+  api: ['api', 'cortex', 'backend', 'server'],
+  backend: ['backend', 'api', 'cortex', 'server'],
+  server: ['server', 'api', 'cortex', 'backend'],
+  'ekoa-app': ['ekoa_app', 'ekoa-app', 'app', 'frontend', 'web', 'ui', 'next'],
+  ekoa_app: ['ekoa_app', 'ekoa-app', 'app', 'frontend', 'web', 'ui', 'next'],
+  app: ['app', 'ekoa_app', 'frontend', 'web', 'ui', 'next'],
+  frontend: ['frontend', 'ekoa_app', 'app', 'web', 'ui', 'next'],
+  web: ['web', 'ekoa_app', 'frontend', 'app', 'ui', 'next'],
+  ui: ['ui', 'ekoa_app', 'frontend', 'app', 'web', 'next'],
+  next: ['next', 'ekoa_app', 'frontend', 'app', 'web', 'ui'],
+};
+
+export function packagePortForDir(
+  dirname: string,
+  ports: Record<string, number>,
+): number | undefined {
+  const lower = dirname.toLowerCase();
+  // Direct match first.
+  if (ports[lower] !== undefined) return ports[lower];
+  const aliasChain = DIR_PORT_ALIASES[lower];
+  if (aliasChain) {
+    for (const candidate of aliasChain) {
+      if (ports[candidate] !== undefined) return ports[candidate];
+    }
+  }
+  return undefined;
+}
+
 type ParsedLine =
   | { kind: 'plain'; raw: string }
   | {
@@ -185,12 +220,16 @@ export async function rewriteEnvFiles(
 
   for (const file of fileContents) {
     const out: string[] = [];
+    let sawPortKey = false;
     for (const line of file.lines) {
       if (line.kind === 'plain') {
         out.push(line.raw);
         continue;
       }
       let { value } = line;
+      if (line.key.toUpperCase() === 'PORT') {
+        sawPortKey = true;
+      }
       if (isPortKey(line.key)) {
         const service = serviceForKey(line.key);
         const port = ports[service];
@@ -206,6 +245,26 @@ export async function rewriteEnvFiles(
       });
       out.push(`${line.indent}${line.key}=${line.quoteChar}${value}${line.quoteChar}`);
     }
+
+    // For per-package env files, ensure PORT is set to the package's port.
+    // Many node services (cortex, express, fastify) read process.env.PORT
+    // directly with a hardcoded default — without this, worktrees collide
+    // on the default port. Skip the root env file.
+    const dir = path.posix.dirname(file.rel);
+    if (dir && dir !== '.') {
+      const dirname = path.posix.basename(dir);
+      const portForPackage = packagePortForDir(dirname, ports);
+      if (portForPackage !== undefined && !sawPortKey) {
+        if (out.length > 0 && out[out.length - 1].trim() !== '') {
+          out.push('');
+        }
+        out.push(
+          `# PORT injected by Sequoias (${dirname} package allocation)`,
+        );
+        out.push(`PORT=${portForPackage}`);
+      }
+    }
+
     await fsp.writeFile(path.join(worktreeRoot, file.rel), out.join('\n'));
   }
 

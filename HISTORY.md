@@ -269,6 +269,42 @@ Port chips inside session cards stop event propagation so a chip click opens the
 
 ---
 
+## 2.8 The 4111 collision, third round: cortex reads `process.env.PORT`, not `API_PORT` (2026-05-08)
+
+User restarted cortex from a worktree after the 2.7 fix and still got `EADDRINUSE 0.0.0.0:4111`. Tracing further: `cortex/src/config.ts:10` reads:
+
+```ts
+port: parseInt(process.env.PORT || '4111', 10),
+```
+
+The user's main `.env` has `API_PORT=4111`, but **cortex never reads `API_PORT`**. It reads `PORT`. The 4111 in `.env` is decorative — when cortex bound 4111 on the main checkout, it was simply hitting its hardcoded fallback because `process.env.PORT` was unset. Sequoias' env-rewriter rewrote `API_PORT` (still right thing for orchestration) but cortex didn't care.
+
+**Fix:** the rewriter now injects `PORT=<value>` into per-package env files (e.g. `cortex/.env`) at write time. The value is chosen by `packagePortForDir(dirname, ports)`, which walks an alias chain:
+
+```
+cortex   -> cortex, api, backend, server
+ekoa-app -> ekoa_app, app, frontend, web, ui, next
+backend  -> backend, api, cortex, server
+... etc
+```
+
+For the user's setup: `cortex/.env` is in the `cortex/` directory; the alias chain finds `ports.api = 52753`; the rewriter appends:
+
+```
+# PORT injected by Sequoias (cortex package allocation)
+PORT=52753
+```
+
+cortex's dotenv loader picks up `PORT`, binds the worktree's allocated port, no more 4111 collision.
+
+**Why heuristic and not config?** Most node services read `PORT` (express default, fastify default, Next.js when no `--port`, vite preview, etc.). The dirname → service-name mapping is the cheapest reliable signal — every monorepo this skill might encounter follows similar conventions (`backend/`, `api/`, `frontend/`, `web/`). Generic enough to ship as a default; users with non-standard names just won't get the injection (no harm, no override).
+
+**How to apply:** if you add new monorepo conventions Sequoias should handle, extend `DIR_PORT_ALIASES` in `src/env-rewriter.ts`. If a user reports "service X starts on the wrong port", check whether their service reads `PORT` (vs a named env), and check whether the directory name appears in the alias map.
+
+**Skipped:** writing `PORT=<value>` to the root `.env`. There's no single right `PORT` for a polyrepo root, and most root scripts orchestrate via named keys. Per-package files only.
+
+---
+
 ## 3. Side-quests (not Sequoias work, captured for posterity)
 
 These were mid-session distractions resolved while building Sequoias. Not part of Sequoias' core history but worth recording so future-us doesn't re-investigate.

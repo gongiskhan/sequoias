@@ -7,10 +7,60 @@ import path from 'node:path';
 import {
   discoverEnvFiles,
   isPortKey,
+  packagePortForDir,
   readMainPortMap,
   rewriteEnvFiles,
   serviceForKey,
 } from '../../src/env-rewriter.js';
+
+test('packagePortForDir: cortex dir falls back to api allocation', () => {
+  assert.equal(packagePortForDir('cortex', { api: 52753, ui: 56473 }), 52753);
+});
+
+test('packagePortForDir: ekoa-app dir falls back to ekoa_app allocation', () => {
+  assert.equal(packagePortForDir('ekoa-app', { ekoa_app: 5234, api: 4123 }), 5234);
+});
+
+test('packagePortForDir: direct service name match wins', () => {
+  assert.equal(packagePortForDir('cortex', { cortex: 4567, api: 9999 }), 4567);
+});
+
+test('packagePortForDir: unknown dirname returns undefined', () => {
+  assert.equal(packagePortForDir('mysterious-package', { api: 1, ui: 2 }), undefined);
+});
+
+test('packagePortForDir: backend matches via alias chain', () => {
+  assert.equal(packagePortForDir('backend', { server: 9000 }), 9000);
+});
+
+test('rewriteEnvFiles: per-package file gets PORT= injected', async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'sequoias-pkgport-'));
+  try {
+    await fsp.mkdir(path.join(dir, 'cortex'));
+    await fsp.writeFile(
+      path.join(dir, '.env'),
+      'API_PORT=4111\n',
+    );
+    await fsp.writeFile(
+      path.join(dir, 'cortex/.env'),
+      'SOME_KEY=value\n',
+    );
+
+    await rewriteEnvFiles(
+      dir,
+      ['.env', 'cortex/.env'],
+      { branch: 'feature/pkg', mainPortMap: { 4111: { service: 'api', key: 'API_PORT' } } },
+    );
+
+    const cortexEnv = await fsp.readFile(path.join(dir, 'cortex/.env'), 'utf8');
+    assert.match(cortexEnv, /^PORT=\d+$/m);
+    const rootEnv = await fsp.readFile(path.join(dir, '.env'), 'utf8');
+    // Root .env should NOT have PORT= injected (root, not a package).
+    assert.doesNotMatch(rootEnv, /^PORT=/m);
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true });
+  }
+});
 
 async function makeTmpDir(): Promise<string> {
   return fsp.mkdtemp(path.join(os.tmpdir(), 'sequoias-env-'));
