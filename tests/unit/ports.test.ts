@@ -5,6 +5,9 @@ import {
   basePort,
   fnv1a32,
   rangeFor,
+  isPortInSequoiasRange,
+  SEQUOIAS_PORT_RANGE_START,
+  SEQUOIAS_PORT_RANGE_END,
 } from '../../src/ports.js';
 
 test('fnv1a32 is deterministic', () => {
@@ -16,7 +19,10 @@ test('basePort: same branch + service maps to same port', () => {
   const a = basePort('feature/auth', 'cortex');
   const b = basePort('feature/auth', 'cortex');
   assert.equal(a, b);
-  assert.ok(a >= 4000 && a <= 4999, `expected 4000-4999, got ${a}`);
+  assert.ok(
+    a >= SEQUOIAS_PORT_RANGE_START && a <= SEQUOIAS_PORT_RANGE_END,
+    `expected ${SEQUOIAS_PORT_RANGE_START}-${SEQUOIAS_PORT_RANGE_END}, got ${a}`,
+  );
 });
 
 test('basePort: different branches produce different ports (probabilistic)', () => {
@@ -27,57 +33,48 @@ test('basePort: different branches produce different ports (probabilistic)', () 
   assert.ok(seen.size > 1, 'all 20 branches collided to same port');
 });
 
-test('rangeFor: known service uses fixed range', () => {
-  assert.deepEqual(rangeFor('cortex'), { name: 'cortex', start: 4000, end: 4999 });
-  assert.deepEqual(rangeFor('ekoa_app'), { name: 'ekoa_app', start: 5000, end: 5999 });
+test('rangeFor: every service uses the unified Sequoias range', () => {
+  for (const service of ['cortex', 'ekoa_app', 'api', 'ui', 'ekoa_streaming_allowed_origins', 'foo', 'bar']) {
+    const r = rangeFor(service);
+    assert.equal(r.start, SEQUOIAS_PORT_RANGE_START);
+    assert.equal(r.end, SEQUOIAS_PORT_RANGE_END);
+  }
 });
 
-test('rangeFor: unknown service falls into 6000+ band', () => {
-  const r = rangeFor('myservice');
-  assert.ok(r.start >= 6000);
-  assert.equal(r.end - r.start, 999);
-});
-
-test('rangeFor: every service name lands within TCP port range', () => {
+test('every service name lands within the Sequoias range', () => {
   const samples = [
-    'api',
-    'ui',
-    'cortex',
-    'ekoa_app',
-    'auth',
-    'cdn',
-    'redis',
-    'pg',
-    'streaming',
-    'edge',
-    'admin',
-    'metrics',
-    'foo',
-    'bar',
-    'baz',
-    'webhooks',
-    'anything-with-very-long-name-here',
-    'ekoa_streaming_allowed_origins',
+    'api', 'ui', 'cortex', 'ekoa_app', 'auth', 'cdn', 'redis', 'pg',
+    'streaming', 'edge', 'admin', 'metrics', 'foo', 'bar', 'baz',
+    'webhooks', 'ekoa_streaming_allowed_origins',
+    'anything-with-a-very-long-name-here',
   ];
   for (const s of samples) {
-    const r = rangeFor(s);
+    const port = basePort('main', s);
     assert.ok(
-      r.start >= 0 && r.end <= 65535,
-      `service "${s}" range ${r.start}-${r.end} exceeds TCP port range`,
+      isPortInSequoiasRange(port),
+      `service "${s}" landed at ${port}, outside ${SEQUOIAS_PORT_RANGE_START}-${SEQUOIAS_PORT_RANGE_END}`,
     );
   }
 });
 
-test('basePort: arbitrary service stays within TCP range', () => {
+test('basePort: 100 random services all in range', () => {
   for (let i = 0; i < 100; i++) {
     const p = basePort(`branch-${i}`, `svc-${i}`);
-    assert.ok(p > 0 && p <= 65535, `port ${p} out of TCP range`);
+    assert.ok(isPortInSequoiasRange(p), `port ${p} out of Sequoias range`);
   }
+});
+
+test('isPortInSequoiasRange: boundary checks', () => {
+  assert.equal(isPortInSequoiasRange(SEQUOIAS_PORT_RANGE_START), true);
+  assert.equal(isPortInSequoiasRange(SEQUOIAS_PORT_RANGE_END), true);
+  assert.equal(isPortInSequoiasRange(SEQUOIAS_PORT_RANGE_START - 1), false);
+  assert.equal(isPortInSequoiasRange(SEQUOIAS_PORT_RANGE_END + 1), false);
+  assert.equal(isPortInSequoiasRange(0), false);
+  assert.equal(isPortInSequoiasRange(80), false);
 });
 
 test('allocatePort: linear-probes past in-use ports', async () => {
   const inUse = new Set<number>();
-  // Force first 3 candidates to appear in use, then succeed.
   let calls = 0;
   const port = await allocatePort('branch-x', 'cortex', {
     isInUse: async (p) => {
@@ -90,7 +87,7 @@ test('allocatePort: linear-probes past in-use ports', async () => {
       return false;
     },
   });
-  assert.ok(port >= 4000 && port <= 4999);
+  assert.ok(isPortInSequoiasRange(port));
 });
 
 test('allocatePort: respects reserved set', async () => {

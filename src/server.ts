@@ -9,8 +9,7 @@ import { loadStore, ensureProject, resolveGlobalConfig } from './store.js';
 import { installHooks, restoreHooks } from './claude-hooks.js';
 import { PtyManager } from './pty-manager.js';
 import { resyncEnvFiles } from './worktree.js';
-
-const MAX_TCP_PORT = 65535;
+import { isPortInSequoiasRange } from './ports.js';
 
 export type ServerOptions = {
   repoPath?: string;
@@ -56,7 +55,8 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   for (const [projectPath, project] of Object.entries(store.data.projects)) {
     for (const session of Object.values(project.sessions)) {
       const bad = Object.entries(session.ports).filter(
-        ([, v]) => !Number.isFinite(v) || v <= 0 || v > MAX_TCP_PORT,
+        ([, v]) =>
+          !Number.isFinite(v) || v <= 0 || !isPortInSequoiasRange(v),
       );
       if (bad.length === 0) continue;
       try {

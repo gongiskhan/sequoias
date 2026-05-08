@@ -16,6 +16,8 @@ import {
   resolveGlobalConfig,
   type Store,
 } from './store.js';
+import { killAllInSequoiasRange, listListenersInSequoiasRange } from './kill-switch.js';
+import { SEQUOIAS_PORT_RANGE_START, SEQUOIAS_PORT_RANGE_END } from './ports.js';
 import type { Project } from './types.js';
 import type { PtyManager } from './pty-manager.js';
 import { resolveTerminals, validateTerminals } from './config.js';
@@ -449,6 +451,34 @@ export function registerRoutes(app: Express, deps: RoutesDeps): void {
       killTerminalHandler(project, req, res);
     },
   );
+
+  app.get('/api/port-range', (_req: Request, res: Response) => {
+    res.json({
+      start: SEQUOIAS_PORT_RANGE_START,
+      end: SEQUOIAS_PORT_RANGE_END,
+    });
+  });
+
+  app.get('/api/kill-switch', async (_req: Request, res: Response) => {
+    try {
+      const result = await listListenersInSequoiasRange();
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/kill-switch', async (req: Request, res: Response) => {
+    try {
+      const onlyPids = Array.isArray(req.body?.onlyPids)
+        ? req.body.onlyPids.filter((p: unknown): p is number => typeof p === 'number')
+        : undefined;
+      const result = await killAllInSequoiasRange({ onlyPids });
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: (err as Error).message });
+    }
+  });
 
   app.post('/_hook', (req: Request, res: Response) => {
     const event = String(req.body?.event || '');

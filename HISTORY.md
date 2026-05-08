@@ -305,6 +305,57 @@ cortex's dotenv loader picks up `PORT`, binds the worktree's allocated port, no 
 
 ---
 
+## 2.9 Tree-kill, single port range, and a kill switch (2026-05-08, fourth session)
+
+### 2.9.1 Stop button now kills the whole tree
+
+Stop sent SIGHUP to the pty leader, which left npm-run-all and its grandchildren (tsx watch, next dev, cortex) running. They held their bound ports across "stops", and a re-start hit EADDRINUSE.
+
+Fix: `killTreeSync` in `pty-manager.ts` does two passes:
+1. `process.kill(-pid, signal)` — process group signal. node-pty makes the spawned shell a session leader (via `setsid`), so child processes that didn't reset their pgrp get the signal here.
+2. `ps -axo pid,ppid` walk to find every descendant by direct parent-chain, signalling each individually. Catches anything that detached.
+
+Kill flow: SIGTERM → 1s grace → SIGKILL. Applied in `kill()` (Stop button), `killSession()` (delete worktree), and `killAll()` (server shutdown).
+
+### 2.9.2 Single port range 50000-54999
+
+Replaced the multi-band scheme (cortex 4000-4999, ekoa_app 5000-5999, fallback 6000+ in 1000-port slots) with one unified 5000-port band. Every service hashes into the same range. Two reasons:
+- The previous fallback could (and did) produce ports above 65535, which Node's `server.listen` rejects.
+- A single contiguous range makes the kill switch (below) tractable: scan that range with `lsof`, signal what's there.
+
+Auto-heal on startup now triggers on any port outside the new range, so existing sessions get re-allocated and their env files rewritten on first server boot post-upgrade.
+
+The unit tests under `tests/unit/ports.test.ts` were rewritten — every service-name sample (cortex, api, ui, ekoa_streaming_allowed_origins, etc.) is asserted to land within the range, plus a 100-iteration property test on `basePort`.
+
+### 2.9.3 Global kill switch
+
+Two endpoints:
+- `GET /api/kill-switch` — preview. Runs `lsof -iTCP -sTCP:LISTEN -P -n -Fpcn`, parses the field-coded output (`p<pid>` / `c<command>` / `n<host:port>`), returns `{ ports: [{ port, pid, command }, …] }` for every listener inside the Sequoias range.
+- `POST /api/kill-switch` — kills. Optional `{ onlyPids: number[] }` body to filter; default is everything in range. Tree-kills via the helper in 2.9.1.
+
+UI: a Danger-zone section in Global settings with a single button. Click → fetches preview → shows a confirm dialog with the full list of `command (pid X) on port N` so the user can verify nothing they care about is in the range before confirming. (The first test of this surfaced "Jump Desktop on 54918" in the kill list — exactly the kind of false positive the preview step exists to catch.)
+
+**Trust posture:** the kill switch can terminate any process the OS lets the Sequoias process signal. There's no auth, and Sequoias binds 0.0.0.0 by default. Anyone on Tailscale who can reach the server can hit `POST /api/kill-switch`. On a solo dev machine with Tailscale-only remote access this is acceptable; a future hardening pass could token-gate this endpoint specifically.
+
+### 2.9.4 Workspace env files now update in place
+
+`ensureWorkspacePortFiles` previously only created env files in workspace dirs that had none — once the file existed, subsequent resyncs ignored it and its PORT line drifted out of the new range. Updated logic:
+
+- File doesn't exist → create with header comment + PORT.
+- File exists, looks "Sequoias-managed" (header comment + only a PORT line) → regenerate.
+- File exists with mixed content (PORT line + other keys) → rewrite the PORT line in place, preserve everything else.
+- File exists, no PORT line → append a PORT block (with marker comment).
+
+This handles the upgrade path from the multi-band era cleanly, and protects user-added keys in workspace env files.
+
+### 2.9.5 Resync env merge keeps stale `port` keys
+
+Cosmetic but worth flagging: `resyncEnvFiles` returns `mergedPorts = { ...existingPorts, ...ports }`. If a previous resync wrote a `port` service entry (e.g. when bare `PORT=` in a per-package file was treated as a service before the 2.7 fix), that key persists in `session.ports` even though no env file uses it.
+
+**How to apply:** harmless, but if state.json looks cluttered, recreating the session is the cleanest fix. A future cleanup could drop unrecognized service keys after each rewrite, but that risks losing legitimately-allocated services that don't appear in env files yet.
+
+---
+
 ## 3. Side-quests (not Sequoias work, captured for posterity)
 
 These were mid-session distractions resolved while building Sequoias. Not part of Sequoias' core history but worth recording so future-us doesn't re-investigate.

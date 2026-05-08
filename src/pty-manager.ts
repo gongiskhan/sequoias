@@ -1,5 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
+import { execSync } from 'node:child_process';
 import { spawn } from 'node-pty';
 import type { IPty } from 'node-pty';
 import type { WebSocket } from 'ws';
@@ -36,6 +37,60 @@ type Entry = PtyEntry | JsonlEntry;
 
 const MAX_BUFFER = 400;
 const FALLBACK_IDLE_MS = 60_000;
+const SIGKILL_DELAY_MS = 1000;
+
+// Kill a process and every descendant. node-pty's `pty.kill()` only signals
+// the spawned shell — when that shell ran `npm-run-all --parallel ...`, the
+// grandchildren (tsx watch / next dev / etc.) keep running and keep their
+// ports bound. We send the signal to the entire process group AND to every
+// descendant we can find via `ps` so nothing escapes.
+function killTreeSync(rootPid: number, signal: NodeJS.Signals): void {
+  if (!Number.isFinite(rootPid) || rootPid <= 0) return;
+  // Process group first — node-pty makes the spawned shell a session leader
+  // (via setsid), so child processes typically share its pgrp.
+  try {
+    process.kill(-rootPid, signal);
+  } catch {
+    // root may have died already, or isn't a pgrp leader — fall through.
+  }
+  // Walk descendants for any process that escaped the pgrp (e.g. tools that
+  // call setsid themselves, or detached children).
+  let psOut = '';
+  try {
+    psOut = execSync('ps -axo pid=,ppid=', {
+      encoding: 'utf8',
+      timeout: 1000,
+    });
+  } catch {
+    return;
+  }
+  const childrenOf = new Map<number, number[]>();
+  for (const line of psOut.split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    const ppid = Number(m[2]);
+    if (!Number.isFinite(pid) || !Number.isFinite(ppid)) continue;
+    if (!childrenOf.has(ppid)) childrenOf.set(ppid, []);
+    childrenOf.get(ppid)!.push(pid);
+  }
+  const visited = new Set<number>();
+  const stack = [rootPid];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (visited.has(cur)) continue;
+    visited.add(cur);
+    for (const c of childrenOf.get(cur) || []) stack.push(c);
+  }
+  visited.delete(rootPid); // already signalled via pgrp
+  for (const p of visited) {
+    try {
+      process.kill(p, signal);
+    } catch {
+      // ignore
+    }
+  }
+}
 
 export class PtyManager {
   private byKey = new Map<string, Entry>();
@@ -254,11 +309,16 @@ export class PtyManager {
     if (!entry) return false;
     if (entry.kind === 'pty') {
       if (entry.fallbackTimer) clearInterval(entry.fallbackTimer);
-      try {
-        entry.pty.kill();
-      } catch {
-        // ignore
-      }
+      const pid = entry.pty.pid;
+      // SIGTERM the whole tree first — gives node services a chance to clean
+      // up async resources (open ports, file handles).
+      killTreeSync(pid, 'SIGTERM');
+      try { entry.pty.kill('SIGTERM'); } catch { /* ignore */ }
+      // SIGKILL stragglers after a short grace period.
+      setTimeout(() => {
+        killTreeSync(pid, 'SIGKILL');
+        try { entry.pty.kill('SIGKILL'); } catch { /* ignore */ }
+      }, SIGKILL_DELAY_MS);
       if (entry.terminal.name === 'claude') {
         const cwd = resolveCwd(entry.worktreePath, entry.terminal.cwd);
         this.byCwd.delete(cwd);
@@ -286,16 +346,27 @@ export class PtyManager {
   }
 
   killAll(): void {
+    const ptyPids: number[] = [];
     for (const [, entry] of this.byKey) {
       if (entry.kind === 'pty') {
         if (entry.fallbackTimer) clearInterval(entry.fallbackTimer);
-        try { entry.pty.kill(); } catch { /* ignore */ }
+        const pid = entry.pty.pid;
+        killTreeSync(pid, 'SIGTERM');
+        try { entry.pty.kill('SIGTERM'); } catch { /* ignore */ }
+        ptyPids.push(pid);
       } else {
         entry.tailer.stop();
       }
       for (const ws of entry.sockets) {
         try { ws.close(); } catch { /* ignore */ }
       }
+    }
+    // SIGKILL stragglers shortly after — process exit on shutdown shouldn't
+    // hang waiting for slow children.
+    if (ptyPids.length > 0) {
+      setTimeout(() => {
+        for (const pid of ptyPids) killTreeSync(pid, 'SIGKILL');
+      }, SIGKILL_DELAY_MS);
     }
     this.byKey.clear();
     this.byCwd.clear();
@@ -340,6 +411,12 @@ export class PtyManager {
   private key(projectPath: string, branch: string, terminalName: string): string {
     return `${projectPath}::${branch}::${terminalName}`;
   }
+}
+
+// Public helper exposed for the kill-switch endpoint and any other callers
+// that need to nuke a process tree without holding a PtyManager entry.
+export function killTree(rootPid: number, signal: NodeJS.Signals): void {
+  killTreeSync(rootPid, signal);
 }
 
 function resolveCwd(worktreePath: string, terminalCwd: string): string {

@@ -807,6 +807,30 @@ a:hover { text-decoration: underline; }
   border-top: 1px solid var(--border);
 }
 .global-section:first-of-type { border-top: none; padding-top: 0; }
+.global-section.danger-zone {
+  border-top: 1px solid var(--red);
+  margin-top: var(--space-2);
+}
+.global-section.danger-zone .global-section-title { color: var(--red); }
+.kill-switch-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  align-self: flex-start;
+  padding: 9px 16px;
+  font-weight: 600;
+  color: var(--red);
+  background: var(--red-soft);
+  border: 1px solid var(--red);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.kill-switch-btn:hover:not(:disabled) {
+  background: var(--red);
+  color: #FFF8EE;
+}
+.kill-switch-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .global-section-title {
   font-size: 11px;
   text-transform: uppercase;

@@ -430,7 +430,8 @@ test('12. survives server restart with sessions intact', async () => {
 test('13. allocator linear-probes when bind-port already in use', async () => {
   // Bind a port deterministically — first compute basePort for our branch and
   // bind it, then create the session; expect a different port to be assigned.
-  const { basePort } = await import('../../src/ports.js');
+  const { basePort, SEQUOIAS_PORT_RANGE_START, SEQUOIAS_PORT_RANGE_END } =
+    await import('../../src/ports.js');
   const branch = 'feature/probe';
   const expectedFirst = basePort(branch, 'cortex');
 
@@ -441,8 +442,8 @@ test('13. allocator linear-probes when bind-port already in use', async () => {
     await createSessionViaApi(branch);
     const ports = await fetchSessionPorts(branch);
     expect(ports.cortex).not.toBe(expectedFirst);
-    expect(ports.cortex).toBeGreaterThanOrEqual(4000);
-    expect(ports.cortex).toBeLessThanOrEqual(4999);
+    expect(ports.cortex).toBeGreaterThanOrEqual(SEQUOIAS_PORT_RANGE_START);
+    expect(ports.cortex).toBeLessThanOrEqual(SEQUOIAS_PORT_RANGE_END);
   } finally {
     await new Promise<void>((resolve) => blocker.close(() => resolve()));
   }

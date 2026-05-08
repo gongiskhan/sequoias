@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Plus, Trash2 } from 'lucide-react';
+import { Plus, Trash2, AlertTriangle } from 'lucide-react';
 import type { ResolvedGlobalConfig, ThemePreference } from '../types.js';
 
 type Props = {
@@ -13,13 +13,66 @@ export function GlobalSettingsDialog({ onClose }: Props): JSX.Element {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [newProject, setNewProject] = useState('');
+  const [portRange, setPortRange] = useState<{ start: number; end: number } | null>(null);
+  const [killing, setKilling] = useState(false);
+  const [lastKill, setLastKill] = useState<string | null>(null);
 
   useEffect(() => {
     fetch('/api/global-config')
       .then((r) => r.json())
       .then((d: ResolvedGlobalConfig) => setConfig(d))
       .catch((err) => setError((err as Error).message));
+    fetch('/api/port-range')
+      .then((r) => r.json())
+      .then(setPortRange)
+      .catch(() => undefined);
   }, []);
+
+  const killSwitch = async () => {
+    if (!portRange) return;
+    setKilling(true);
+    setLastKill(null);
+    try {
+      // Preview first.
+      const preview = await fetch('/api/kill-switch').then((r) => r.json());
+      const ports: { port: number; pid: number; command: string }[] =
+        preview.ports || [];
+      if (ports.length === 0) {
+        setLastKill(
+          `Nothing to kill — no listeners in ${portRange.start}-${portRange.end}.`,
+        );
+        return;
+      }
+      const lines = ports
+        .map((p) => `  ${p.command} (pid ${p.pid}) on port ${p.port}`)
+        .join('\n');
+      const ok = window.confirm(
+        `About to kill ${ports.length} process${ports.length === 1 ? '' : 'es'} in ports ${portRange.start}-${portRange.end}:\n\n${lines}\n\nCheck the list above for anything you want to keep (Jump Desktop, VPN clients, screen sharing tools, etc. sometimes land in this range). Continue?`,
+      );
+      if (!ok) {
+        setLastKill('Cancelled.');
+        return;
+      }
+      const res = await fetch('/api/kill-switch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || `request failed: ${res.status}`);
+      const n = (body.pidsKilled || []).length;
+      const summary = (body.ports || [])
+        .map((p: { port: number; command: string }) => `${p.command}:${p.port}`)
+        .join(', ');
+      setLastKill(
+        `Killed ${n} process${n === 1 ? '' : 'es'}: ${summary}`,
+      );
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setKilling(false);
+    }
+  };
 
   if (!config) {
     return (
@@ -184,6 +237,29 @@ export function GlobalSettingsDialog({ onClose }: Props): JSX.Element {
               <Plus size={13} /> Add
             </button>
           </div>
+        </div>
+
+        <div className="global-section danger-zone">
+          <div className="global-section-title">Danger zone</div>
+          <p className="dialog-hint">
+            Kill every process listening on a port in
+            {portRange ? ` ${portRange.start}-${portRange.end}` : ' the Sequoias range'}.
+            Use this when worktrees pile up, or after restarting Sequoias and
+            something is still bound to a worktree port.
+          </p>
+          <button
+            type="button"
+            className="kill-switch-btn"
+            onClick={() => void killSwitch()}
+            disabled={killing || !portRange}
+            data-testid="kill-switch-btn"
+          >
+            <AlertTriangle size={14} />
+            {killing ? 'Killing…' : 'Kill all processes in port range'}
+          </button>
+          {lastKill && (
+            <div className="dialog-hint" data-testid="kill-switch-result">{lastKill}</div>
+          )}
         </div>
 
         {error && (

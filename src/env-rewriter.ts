@@ -157,12 +157,12 @@ export async function ensureWorkspacePortFiles(
   worktreeRoot: string,
   ports: Record<string, number>,
 ): Promise<string[]> {
-  const created: string[] = [];
+  const touched: string[] = [];
   let entries: import('node:fs').Dirent[];
   try {
     entries = fs.readdirSync(worktreeRoot, { withFileTypes: true });
   } catch {
-    return created;
+    return touched;
   }
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
@@ -170,24 +170,78 @@ export async function ensureWorkspacePortFiles(
     if (entry.name === 'node_modules') continue;
     const dir = path.join(worktreeRoot, entry.name);
     if (!fs.existsSync(path.join(dir, 'package.json'))) continue;
-    // Skip if any .env* file already exists in this dir (rewriter handled it).
-    const dirEntries = fs.readdirSync(dir, { withFileTypes: true });
-    if (dirEntries.some((e) => e.isFile() && /^\.env(\..+)?$/.test(e.name))) {
-      continue;
-    }
     const port = packagePortForDir(entry.name, ports);
     if (port === undefined) continue;
+
+    // If the package already has an env file, we trust the main-rewriter
+    // pass to handle rewrites for files that were copied from main.
+    // ekoa/.env-style files are different: they were created by Sequoias
+    // (no upstream version), so the rewriter doesn't touch them. Update
+    // their PORT line in place.
+    const dirEntries = fs.readdirSync(dir, { withFileTypes: true });
+    const dotEnv = dirEntries.find(
+      (e) => e.isFile() && e.name === '.env',
+    );
     const target = path.join(dir, '.env');
-    const content =
-      `# PORT injected by Sequoias (${entry.name} workspace allocation)\n` +
-      `# This package's dev script reads process.env.PORT but the upstream\n` +
-      `# repo doesn't track an env file here, so Sequoias creates one to\n` +
-      `# avoid cross-worktree collisions on default ports.\n` +
-      `PORT=${port}\n`;
-    await fsp.writeFile(target, content);
-    created.push(path.posix.join(entry.name, '.env'));
+
+    if (!dotEnv) {
+      const content =
+        `# PORT injected by Sequoias (${entry.name} workspace allocation)\n` +
+        `# This package's dev script reads process.env.PORT but the upstream\n` +
+        `# repo doesn't track an env file here, so Sequoias creates one to\n` +
+        `# avoid cross-worktree collisions on default ports.\n` +
+        `PORT=${port}\n`;
+      await fsp.writeFile(target, content);
+      touched.push(path.posix.join(entry.name, '.env'));
+      continue;
+    }
+
+    // File exists. Check whether it looks "Sequoias-managed" (header
+    // comment present and only a PORT= line). If yes, overwrite. If it has
+    // other keys we don't recognize, just update the PORT line and leave
+    // everything else alone.
+    let existing = '';
+    try {
+      existing = await fsp.readFile(target, 'utf8');
+    } catch {
+      continue;
+    }
+    const isOurs = /^# PORT injected by Sequoias/m.test(existing);
+    const hasPortLine = /^PORT=/m.test(existing);
+
+    if (isOurs && hasPortLine && existing.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith('#')).length === 1) {
+      // Pure Sequoias-managed file: regenerate.
+      const content =
+        `# PORT injected by Sequoias (${entry.name} workspace allocation)\n` +
+        `# This package's dev script reads process.env.PORT but the upstream\n` +
+        `# repo doesn't track an env file here, so Sequoias creates one to\n` +
+        `# avoid cross-worktree collisions on default ports.\n` +
+        `PORT=${port}\n`;
+      if (existing !== content) {
+        await fsp.writeFile(target, content);
+        touched.push(path.posix.join(entry.name, '.env'));
+      }
+      continue;
+    }
+
+    // Mixed file: rewrite only the PORT= line, preserve everything else.
+    if (hasPortLine) {
+      const next = existing.replace(/^PORT=.*$/m, `PORT=${port}`);
+      if (next !== existing) {
+        await fsp.writeFile(target, next);
+        touched.push(path.posix.join(entry.name, '.env'));
+      }
+    } else {
+      const next =
+        existing.endsWith('\n') ? existing : existing + '\n';
+      const appended =
+        next +
+        `\n# PORT injected by Sequoias (${entry.name} workspace allocation)\nPORT=${port}\n`;
+      await fsp.writeFile(target, appended);
+      touched.push(path.posix.join(entry.name, '.env'));
+    }
   }
-  return created;
+  return touched;
 }
 
 export function packagePortForDir(

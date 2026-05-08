@@ -2,20 +2,17 @@ import { execa } from 'execa';
 
 export type ServiceRange = { name: string; start: number; end: number };
 
-export const DEFAULT_RANGES: ServiceRange[] = [
-  { name: 'cortex', start: 4000, end: 4999 },
-  { name: 'ekoa_app', start: 5000, end: 5999 },
-];
-
-const FALLBACK_BAND_START = 6000;
-const FALLBACK_BAND_SIZE = 1000;
-const MAX_TCP_PORT = 65535;
-// Largest band-end <= MAX_TCP_PORT. With start=6000 and size=1000, 59 slots
-// span 6000..64999, all within the valid TCP range.
-const FALLBACK_SLOT_COUNT = Math.floor(
-  (MAX_TCP_PORT - FALLBACK_BAND_START + 1) / FALLBACK_BAND_SIZE,
-);
+// One band for all services. Avoids fragmentation across worktrees + lets a
+// single kill-switch sweep clear every Sequoias-managed process by port range.
+export const SEQUOIAS_PORT_RANGE_START = 50000;
+export const SEQUOIAS_PORT_RANGE_END = 54999;
+const SEQUOIAS_PORT_RANGE_SIZE =
+  SEQUOIAS_PORT_RANGE_END - SEQUOIAS_PORT_RANGE_START + 1;
 const PROBE_LIMIT = 50;
+
+// Kept exported for back-compat with any callers; allocation now uses the
+// unified range regardless of named entries.
+export const DEFAULT_RANGES: ServiceRange[] = [];
 
 export function fnv1a32(input: string): number {
   let hash = 0x811c9dc5;
@@ -26,19 +23,21 @@ export function fnv1a32(input: string): number {
   return hash >>> 0;
 }
 
-export function rangeFor(service: string, ranges: ServiceRange[] = DEFAULT_RANGES): ServiceRange {
-  const known = ranges.find((r) => r.name === service);
-  if (known) return known;
-  const slot = fnv1a32(service) % FALLBACK_SLOT_COUNT;
-  const start = FALLBACK_BAND_START + slot * FALLBACK_BAND_SIZE;
-  return { name: service, start, end: start + FALLBACK_BAND_SIZE - 1 };
+export function rangeFor(service: string, _ranges: ServiceRange[] = DEFAULT_RANGES): ServiceRange {
+  return {
+    name: service,
+    start: SEQUOIAS_PORT_RANGE_START,
+    end: SEQUOIAS_PORT_RANGE_END,
+  };
 }
 
-export function basePort(branch: string, service: string, ranges: ServiceRange[] = DEFAULT_RANGES): number {
-  const r = rangeFor(service, ranges);
-  const span = r.end - r.start + 1;
-  const offset = fnv1a32(`${branch}:${service}`) % span;
-  return r.start + offset;
+export function basePort(branch: string, service: string, _ranges: ServiceRange[] = DEFAULT_RANGES): number {
+  const offset = fnv1a32(`${branch}:${service}`) % SEQUOIAS_PORT_RANGE_SIZE;
+  return SEQUOIAS_PORT_RANGE_START + offset;
+}
+
+export function isPortInSequoiasRange(port: number): boolean {
+  return port >= SEQUOIAS_PORT_RANGE_START && port <= SEQUOIAS_PORT_RANGE_END;
 }
 
 export async function isPortInUse(port: number): Promise<boolean> {
@@ -65,14 +64,14 @@ export async function allocatePort(
   service: string,
   opts: AllocateOptions = {},
 ): Promise<number> {
-  const ranges = opts.ranges ?? DEFAULT_RANGES;
   const reserved = opts.reserved ?? new Set<number>();
   const isInUse = opts.isInUse ?? isPortInUse;
-  const r = rangeFor(service, ranges);
-  let candidate = basePort(branch, service, ranges);
+  const r = rangeFor(service);
+  const span = r.end - r.start + 1;
+  let candidate = basePort(branch, service);
   for (let i = 0; i < PROBE_LIMIT; i++) {
     const probe = candidate + i;
-    const wrapped = probe > r.end ? r.start + ((probe - r.start) % (r.end - r.start + 1)) : probe;
+    const wrapped = probe > r.end ? r.start + ((probe - r.start) % span) : probe;
     if (reserved.has(wrapped)) continue;
     // eslint-disable-next-line no-await-in-loop
     if (!(await isInUse(wrapped))) {
