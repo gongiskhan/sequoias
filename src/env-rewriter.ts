@@ -135,12 +135,60 @@ const DIR_PORT_ALIASES: Record<string, string[]> = {
   server: ['server', 'api', 'cortex', 'backend'],
   'ekoa-app': ['ekoa_app', 'ekoa-app', 'app', 'frontend', 'web', 'ui', 'next'],
   ekoa_app: ['ekoa_app', 'ekoa-app', 'app', 'frontend', 'web', 'ui', 'next'],
+  ekoa: ['ekoa_app', 'ekoa-app', 'ekoa', 'app', 'frontend', 'web', 'ui', 'next'],
   app: ['app', 'ekoa_app', 'frontend', 'web', 'ui', 'next'],
   frontend: ['frontend', 'ekoa_app', 'app', 'web', 'ui', 'next'],
   web: ['web', 'ekoa_app', 'frontend', 'app', 'ui', 'next'],
   ui: ['ui', 'ekoa_app', 'frontend', 'app', 'web', 'next'],
   next: ['next', 'ekoa_app', 'frontend', 'app', 'web', 'ui'],
+  client: ['client', 'frontend', 'web', 'ui', 'app', 'ekoa_app'],
 };
+
+// For each first-level subdir of the worktree that:
+//   (a) contains a package.json (i.e. is a workspace), AND
+//   (b) has no env file at all (so the rewriter never touched it), AND
+//   (c) maps to an allocated port via packagePortForDir
+// create a minimal `.env` containing just `PORT=<value>`. This handles the
+// common case where the upstream repo doesn't track per-workspace env files
+// but the workspace's dev script reads process.env.PORT (Next.js, Vite,
+// express, etc.) and falls back to a hardcoded default that collides
+// across worktrees.
+export async function ensureWorkspacePortFiles(
+  worktreeRoot: string,
+  ports: Record<string, number>,
+): Promise<string[]> {
+  const created: string[] = [];
+  let entries: import('node:fs').Dirent[];
+  try {
+    entries = fs.readdirSync(worktreeRoot, { withFileTypes: true });
+  } catch {
+    return created;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    if (entry.name.startsWith('.')) continue;
+    if (entry.name === 'node_modules') continue;
+    const dir = path.join(worktreeRoot, entry.name);
+    if (!fs.existsSync(path.join(dir, 'package.json'))) continue;
+    // Skip if any .env* file already exists in this dir (rewriter handled it).
+    const dirEntries = fs.readdirSync(dir, { withFileTypes: true });
+    if (dirEntries.some((e) => e.isFile() && /^\.env(\..+)?$/.test(e.name))) {
+      continue;
+    }
+    const port = packagePortForDir(entry.name, ports);
+    if (port === undefined) continue;
+    const target = path.join(dir, '.env');
+    const content =
+      `# PORT injected by Sequoias (${entry.name} workspace allocation)\n` +
+      `# This package's dev script reads process.env.PORT but the upstream\n` +
+      `# repo doesn't track an env file here, so Sequoias creates one to\n` +
+      `# avoid cross-worktree collisions on default ports.\n` +
+      `PORT=${port}\n`;
+    await fsp.writeFile(target, content);
+    created.push(path.posix.join(entry.name, '.env'));
+  }
+  return created;
+}
 
 export function packagePortForDir(
   dirname: string,
@@ -199,10 +247,22 @@ export async function rewriteEnvFiles(
     }
     const lines = content.split(/\r?\n/).map(parseLine);
     fileContents.push({ rel, lines, original: content });
+    const fileDir = path.posix.dirname(rel);
+    const fileInPackage = fileDir && fileDir !== '.';
     for (const line of lines) {
       if (line.kind !== 'kv') continue;
       if (isPortKey(line.key)) {
-        servicesNeeded.add(serviceForKey(line.key));
+        // Bare `PORT` in a per-package env file (e.g. cortex/.env) is
+        // resolved via packagePortForDir at write time — don't allocate a
+        // separate "port" service for it, otherwise the value drifts away
+        // from the package's real allocation on each resync. In the root
+        // .env, bare `PORT` is still treated as its own service, since
+        // it's the orchestrator's choice.
+        if (line.key.toUpperCase() === 'PORT' && fileInPackage) {
+          // skip
+        } else {
+          servicesNeeded.add(serviceForKey(line.key));
+        }
       }
       const urlPortRe = /(?:localhost|127\.0\.0\.1):(\d{2,5})/g;
       let m: RegExpExecArray | null;
@@ -221,6 +281,9 @@ export async function rewriteEnvFiles(
   for (const file of fileContents) {
     const out: string[] = [];
     let sawPortKey = false;
+    const dir = path.posix.dirname(file.rel);
+    const dirname = dir && dir !== '.' ? path.posix.basename(dir) : '';
+    const packagePort = dirname ? packagePortForDir(dirname, ports) : undefined;
     for (const line of file.lines) {
       if (line.kind === 'plain') {
         out.push(line.raw);
@@ -229,8 +292,15 @@ export async function rewriteEnvFiles(
       let { value } = line;
       if (line.key.toUpperCase() === 'PORT') {
         sawPortKey = true;
-      }
-      if (isPortKey(line.key)) {
+        if (dirname && packagePort !== undefined) {
+          // Per-package PORT: use packagePortForDir mapping.
+          value = String(packagePort);
+        } else if (!dirname) {
+          // Root PORT: treated as its own "port" service (back-compat).
+          const port = ports[serviceForKey(line.key)];
+          if (port != null) value = String(port);
+        }
+      } else if (isPortKey(line.key)) {
         const service = serviceForKey(line.key);
         const port = ports[service];
         if (port != null) value = String(port);
@@ -250,10 +320,8 @@ export async function rewriteEnvFiles(
     // Many node services (cortex, express, fastify) read process.env.PORT
     // directly with a hardcoded default — without this, worktrees collide
     // on the default port. Skip the root env file.
-    const dir = path.posix.dirname(file.rel);
     if (dir && dir !== '.') {
-      const dirname = path.posix.basename(dir);
-      const portForPackage = packagePortForDir(dirname, ports);
+      const portForPackage = packagePort;
       if (portForPackage !== undefined && !sawPortKey) {
         if (out.length > 0 && out[out.length - 1].trim() !== '') {
           out.push('');

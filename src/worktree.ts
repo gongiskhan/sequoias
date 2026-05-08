@@ -6,6 +6,7 @@ import { simpleGit } from 'simple-git';
 import { worktreeDir, slugify } from './paths.js';
 import {
   discoverEnvFiles,
+  ensureWorkspacePortFiles,
   readMainPortMap,
   rewriteEnvFiles,
 } from './env-rewriter.js';
@@ -79,6 +80,11 @@ export async function createWorktree(args: CreateWorktreeArgs): Promise<{
     branch,
     mainPortMap,
   });
+
+  const createdPortFiles = await ensureWorkspacePortFiles(targetDir, ports);
+  for (const f of createdPortFiles) {
+    if (!worktreeEnvFiles.includes(f)) worktreeEnvFiles.push(f);
+  }
 
   await fsp.writeFile(
     path.join(targetDir, '.sequoias-meta.json'),
@@ -179,6 +185,11 @@ export async function resyncEnvFiles(args: {
     mainPortMap: extendedMap,
     reserved,
   });
+
+  const createdPortFiles = await ensureWorkspacePortFiles(worktreePath, ports);
+  for (const f of createdPortFiles) {
+    if (!mainEnvFiles.includes(f)) mainEnvFiles.push(f);
+  }
 
   const mergedPorts = { ...existingPorts, ...ports };
 
