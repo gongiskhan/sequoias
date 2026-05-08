@@ -137,7 +137,14 @@ exit 0
 
   const serverProc = spawn(
     process.execPath,
-    [path.resolve('dist/server/cli.js'), repoPath, '--port', String(serverPort)],
+    [
+      path.resolve('dist/server/cli.js'),
+      repoPath,
+      '--port',
+      String(serverPort),
+      '--host',
+      '127.0.0.1',
+    ],
     {
       cwd: path.resolve('.'),
       env,

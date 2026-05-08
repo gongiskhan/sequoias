@@ -8,3 +8,4 @@ logs/
 
 # Claude Code project state — keep settings.json and scripts/, drop the local audit marker
 .claude/.state/
+.idea

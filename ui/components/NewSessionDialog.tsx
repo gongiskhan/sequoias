@@ -3,9 +3,16 @@ import React, { useEffect, useState } from 'react';
 type Props = {
   onClose: () => void;
   onCreate: (branch: string, baseBranch?: string) => Promise<void>;
+  projectId?: string;
+  projectName?: string;
 };
 
-export function NewSessionDialog({ onClose, onCreate }: Props): JSX.Element {
+export function NewSessionDialog({
+  onClose,
+  onCreate,
+  projectId,
+  projectName,
+}: Props): JSX.Element {
   const [branch, setBranch] = useState('');
   const [base, setBase] = useState('');
   const [branches, setBranches] = useState<string[]>([]);
@@ -13,14 +20,15 @@ export function NewSessionDialog({ onClose, onCreate }: Props): JSX.Element {
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    fetch('/api/branches')
+    const url = projectId ? `/api/projects/${projectId}/branches` : '/api/branches';
+    fetch(url)
       .then((r) => r.json())
       .then((d) => {
         setBranches(d.branches || []);
         const def = ['main', 'master'].find((m) => d.branches?.includes(m));
         if (def) setBase(def);
       });
-  }, []);
+  }, [projectId]);
 
   const submit = async () => {
     if (!branch.trim()) {
@@ -47,7 +55,7 @@ export function NewSessionDialog({ onClose, onCreate }: Props): JSX.Element {
           void submit();
         }}
       >
-        <h2>New session</h2>
+        <h2>New session{projectName ? ` · ${projectName}` : ''}</h2>
         <label>
           Branch
           <input

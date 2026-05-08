@@ -1,0 +1,19 @@
+{
+  "name": "Sequoias",
+  "short_name": "Sequoias",
+  "description": "Local dashboard for parallel Claude Code worktrees",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "theme_color": "#0e1217",
+  "background_color": "#0e1217",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

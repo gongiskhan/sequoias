@@ -9,6 +9,12 @@ export const DEFAULT_RANGES: ServiceRange[] = [
 
 const FALLBACK_BAND_START = 6000;
 const FALLBACK_BAND_SIZE = 1000;
+const MAX_TCP_PORT = 65535;
+// Largest band-end <= MAX_TCP_PORT. With start=6000 and size=1000, 59 slots
+// span 6000..64999, all within the valid TCP range.
+const FALLBACK_SLOT_COUNT = Math.floor(
+  (MAX_TCP_PORT - FALLBACK_BAND_START + 1) / FALLBACK_BAND_SIZE,
+);
 const PROBE_LIMIT = 50;
 
 export function fnv1a32(input: string): number {
@@ -23,7 +29,7 @@ export function fnv1a32(input: string): number {
 export function rangeFor(service: string, ranges: ServiceRange[] = DEFAULT_RANGES): ServiceRange {
   const known = ranges.find((r) => r.name === service);
   if (known) return known;
-  const slot = fnv1a32(service) % 100;
+  const slot = fnv1a32(service) % FALLBACK_SLOT_COUNT;
   const start = FALLBACK_BAND_START + slot * FALLBACK_BAND_SIZE;
   return { name: service, start, end: start + FALLBACK_BAND_SIZE - 1 };
 }

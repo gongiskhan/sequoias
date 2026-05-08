@@ -3,11 +3,13 @@ import fs from 'node:fs';
 import { spawn } from 'node-pty';
 import type { IPty } from 'node-pty';
 import type { WebSocket } from 'ws';
-import type { Store } from './store.js';
+import { projectIdFor, type Store } from './store.js';
 import type { Session, SessionStatus } from './types.js';
-import type { TerminalConfig } from './config.js';
+import type { TerminalConfig, TerminalKind } from './config.js';
+import { JsonlTailer } from './jsonl-tail.js';
 
-type Entry = {
+type PtyEntry = {
+  kind: 'pty';
   pty: IPty;
   branch: string;
   projectPath: string;
@@ -19,12 +21,25 @@ type Entry = {
   fallbackTimer?: NodeJS.Timeout;
 };
 
+type JsonlEntry = {
+  kind: 'jsonl';
+  tailer: JsonlTailer;
+  branch: string;
+  projectPath: string;
+  worktreePath: string;
+  terminal: TerminalConfig;
+  buffer: string[];
+  sockets: Set<WebSocket>;
+};
+
+type Entry = PtyEntry | JsonlEntry;
+
 const MAX_BUFFER = 400;
 const FALLBACK_IDLE_MS = 60_000;
 
 export class PtyManager {
   private byKey = new Map<string, Entry>();
-  private byCwd = new Map<string, Entry>();
+  private byCwd = new Map<string, PtyEntry>();
 
   constructor(private store: Store, private serverPort: number) {}
 
@@ -39,6 +54,54 @@ export class PtyManager {
     const key = this.key(projectPath, session.branch, terminal.name);
     if (this.byKey.has(key)) return this.byKey.get(key)!;
 
+    const kind: TerminalKind = terminal.kind || 'pty';
+    if (kind === 'jsonl') {
+      return this.spawnJsonl(projectPath, session, terminal, key);
+    }
+    return this.spawnPty(projectPath, session, terminal, key);
+  }
+
+  private spawnJsonl(
+    projectPath: string,
+    session: Session,
+    terminal: TerminalConfig,
+    key: string,
+  ): JsonlEntry {
+    const tailer = new JsonlTailer(session.worktreePath);
+    const entry: JsonlEntry = {
+      kind: 'jsonl',
+      tailer,
+      branch: session.branch,
+      projectPath,
+      worktreePath: session.worktreePath,
+      terminal,
+      buffer: [],
+      sockets: new Set(),
+    };
+    tailer.on('data', (chunk: string) => {
+      entry.buffer.push(chunk);
+      if (entry.buffer.length > MAX_BUFFER) entry.buffer.shift();
+      for (const ws of entry.sockets) {
+        if (ws.readyState === ws.OPEN) ws.send(chunk);
+      }
+    });
+    tailer.start();
+    this.byKey.set(key, entry);
+    this.store.broadcast({
+      type: 'terminal-spawn',
+      projectPath,
+      branch: session.branch,
+      terminalName: terminal.name,
+    });
+    return entry;
+  }
+
+  private spawnPty(
+    projectPath: string,
+    session: Session,
+    terminal: TerminalConfig,
+    key: string,
+  ): PtyEntry | null {
     const env: Record<string, string> = {};
     for (const [k, v] of Object.entries(process.env)) {
       if (typeof v === 'string') env[k] = v;
@@ -83,7 +146,8 @@ export class PtyManager {
       return null;
     }
 
-    const entry: Entry = {
+    const entry: PtyEntry = {
+      kind: 'pty',
       pty,
       branch: session.branch,
       projectPath,
@@ -147,13 +211,17 @@ export class PtyManager {
     return entry;
   }
 
-  attach(branch: string, terminalName: string, ws: WebSocket): void {
+  attach(branch: string, terminalName: string, ws: WebSocket, projectId?: string): void {
     let entry: Entry | undefined;
     for (const e of this.byKey.values()) {
-      if (e.branch === branch && e.terminal.name === terminalName) {
-        entry = e;
-        break;
-      }
+      if (e.branch !== branch) continue;
+      if (e.terminal.name !== terminalName) continue;
+      if (projectId && projectIdFor(e.projectPath) !== projectId) continue;
+      entry = e;
+      break;
+    }
+    if (!entry && terminalName === 'claude-live') {
+      entry = this.lazySpawnClaudeLive(branch, projectId);
     }
     if (!entry) {
       ws.send(`\r\n\x1b[33m[${terminalName}] not running. Click restart to spawn it.\x1b[0m\r\n`);
@@ -162,18 +230,21 @@ export class PtyManager {
     }
     entry.sockets.add(ws);
     for (const chunk of entry.buffer) ws.send(chunk);
-    ws.on('message', (raw) => {
-      try {
-        const msg = JSON.parse(raw.toString());
-        if (msg.type === 'data' && typeof msg.data === 'string') {
-          entry!.pty.write(msg.data);
-        } else if (msg.type === 'resize' && msg.cols && msg.rows) {
-          entry!.pty.resize(Number(msg.cols), Number(msg.rows));
+    if (entry.kind === 'pty') {
+      const ptyRef = entry.pty;
+      ws.on('message', (raw) => {
+        try {
+          const msg = JSON.parse(raw.toString());
+          if (msg.type === 'data' && typeof msg.data === 'string') {
+            ptyRef.write(msg.data);
+          } else if (msg.type === 'resize' && msg.cols && msg.rows) {
+            ptyRef.resize(Number(msg.cols), Number(msg.rows));
+          }
+        } catch {
+          ptyRef.write(raw.toString());
         }
-      } catch {
-        entry!.pty.write(raw.toString());
-      }
-    });
+      });
+    }
     ws.on('close', () => entry!.sockets.delete(ws));
   }
 
@@ -181,20 +252,24 @@ export class PtyManager {
     const key = this.key(projectPath, branch, terminalName);
     const entry = this.byKey.get(key);
     if (!entry) return false;
-    if (entry.fallbackTimer) clearInterval(entry.fallbackTimer);
-    try {
-      entry.pty.kill();
-    } catch {
-      // ignore
+    if (entry.kind === 'pty') {
+      if (entry.fallbackTimer) clearInterval(entry.fallbackTimer);
+      try {
+        entry.pty.kill();
+      } catch {
+        // ignore
+      }
+      if (entry.terminal.name === 'claude') {
+        const cwd = resolveCwd(entry.worktreePath, entry.terminal.cwd);
+        this.byCwd.delete(cwd);
+      }
+    } else {
+      entry.tailer.stop();
     }
     for (const ws of entry.sockets) {
       try { ws.close(); } catch { /* ignore */ }
     }
     this.byKey.delete(key);
-    if (entry.terminal.name === 'claude') {
-      const cwd = resolveCwd(entry.worktreePath, entry.terminal.cwd);
-      this.byCwd.delete(cwd);
-    }
     return true;
   }
 
@@ -212,8 +287,12 @@ export class PtyManager {
 
   killAll(): void {
     for (const [, entry] of this.byKey) {
-      if (entry.fallbackTimer) clearInterval(entry.fallbackTimer);
-      try { entry.pty.kill(); } catch { /* ignore */ }
+      if (entry.kind === 'pty') {
+        if (entry.fallbackTimer) clearInterval(entry.fallbackTimer);
+        try { entry.pty.kill(); } catch { /* ignore */ }
+      } else {
+        entry.tailer.stop();
+      }
       for (const ws of entry.sockets) {
         try { ws.close(); } catch { /* ignore */ }
       }
@@ -234,8 +313,28 @@ export class PtyManager {
     return out;
   }
 
-  resolveByCwd(cwd: string): Entry | undefined {
+  resolveByCwd(cwd: string): PtyEntry | undefined {
     return this.byCwd.get(cwd);
+  }
+
+  private lazySpawnClaudeLive(branch: string, projectId?: string): JsonlEntry | undefined {
+    for (const project of Object.values(this.store.data.projects)) {
+      if (projectId && projectIdFor(project.path) !== projectId) continue;
+      const session = project.sessions[branch];
+      if (!session) continue;
+      const config: TerminalConfig = {
+        name: 'claude-live',
+        cwd: '.',
+        cmd: null,
+        autostart: true,
+        background: false,
+        kind: 'jsonl',
+        readOnly: true,
+      };
+      const key = this.key(project.path, branch, 'claude-live');
+      return this.spawnJsonl(project.path, session, config, key);
+    }
+    return undefined;
   }
 
   private key(projectPath: string, branch: string, terminalName: string): string {

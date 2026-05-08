@@ -11,19 +11,27 @@ type StoredTerminal = {
 
 type Props = {
   onClose: () => void;
+  projectId?: string;
 };
 
-export function SettingsDialog({ onClose }: Props): JSX.Element {
+export function SettingsDialog({ onClose, projectId }: Props): JSX.Element {
   const [rows, setRows] = useState<StoredTerminal[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
+  const projectUrl = projectId ? `/api/projects/${projectId}` : null;
+
   useEffect(() => {
-    fetch('/api/config')
+    const fetchUrl = projectUrl ? `${projectUrl}` : '/api/config';
+    fetch(fetchUrl)
       .then((r) => r.json())
-      .then((d) => setRows(d.storedTerminals || []))
+      .then((d) =>
+        setRows(
+          (d.storedTerminals as StoredTerminal[] | undefined) || [],
+        ),
+      )
       .catch(() => undefined);
-  }, []);
+  }, [projectUrl]);
 
   const updateRow = (i: number, patch: Partial<StoredTerminal>) => {
     setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
@@ -53,7 +61,8 @@ export function SettingsDialog({ onClose }: Props): JSX.Element {
           background: r.background,
         })),
       };
-      const res = await fetch('/api/project/terminals', {
+      const url = projectUrl ? `${projectUrl}/terminals` : '/api/project/terminals';
+      const res = await fetch(url, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -78,8 +87,9 @@ export function SettingsDialog({ onClose }: Props): JSX.Element {
       >
         <h2>Project terminals</h2>
         <p className="dialog-hint">
-          Extra terminals spawned for every session. Each gets the session's allocated ports as
-          <code>SEQUOIAS_PORT_&lt;NAME&gt;</code> env vars. Claude is implicit and always present.
+          Extra terminals spawned for every session of this project. Each gets the session's
+          allocated ports as <code>SEQUOIAS_PORT_&lt;NAME&gt;</code> env vars. <code>claude</code>
+          and <code>claude-live</code> are implicit.
         </p>
         <div className="settings-rows">
           <div className="settings-row settings-header">

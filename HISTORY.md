@@ -128,6 +128,109 @@ The user's existing `local-exec` worktree was healed manually with a one-shot `c
 
 ---
 
+## 2.5 IDE coexistence + multi-project + theme + responsive + Tailscale (2026-05-08)
+
+### 2.5.1 What changed in one paragraph
+
+The user uses Rebased (a JetBrains-family fork) for heavier development and wants Sequoias to coexist: monitor Claude Code sessions launched in the IDE alongside the ones it spawns, expose the dashboard over Tailscale to the phone, juggle multiple projects in one rail, and look good in light or dark with system-sync. State now carries a `globalConfig` block (`theme`, `idePath`, `host`, `projects[]`); the CLI's repo path is optional; the server binds `0.0.0.0` by default and prints every reachable URL on startup; the rail is a collapsible project tree; an always-present read-only `claude-live` tab tails `~/.claude/projects/<encoded-cwd>/*.jsonl`, formatted as ANSI in the existing xterm pane.
+
+### 2.5.2 Network exposure trust posture
+
+**Sequoias now binds `0.0.0.0` by default. No auth. Mutating routes (POST/PATCH/DELETE for projects, sessions, globalConfig) are reachable from any LAN host that can dial the port.**
+
+**Why:** the user explicitly opted into phone-over-Tailscale. The advisor flagged this as a step up from loopback-only and asked us to document it before merge so a future hardening pass doesn't regress the user's intent. Tailscale is the intended remote path; trusting the LAN is acceptable on a solo dev machine.
+
+**How to apply:** anyone tightening this back to loopback-only must do so via `--host` or `globalConfig.host`, not by editing the listener hardcode. Future hardening candidates (token-in-URL, mTLS via Tailscale identity, allowlist of remote IPs) belong in this section as planned work — not as silent regressions to the default.
+
+### 2.5.3 Read-only JSONL tab as a virtual PTY entry
+
+**`PtyManager` now hosts entries that don't own a `pty`.** The new `jsonl` kind plumbs through the same WebSocket protocol (`/ws/terminal`) and the same xterm pane on the frontend, but its data source is a `JsonlTailer` polling `~/.claude/projects/<encoded-cwd>/*.jsonl` at 1s. Polling, not `fs.watch` — claude-control found `fs.watch` flaky on macOS and the polling cost is negligible. Rotation is detected by mtime change; on rotation the tailer emits a visible `── new claude session ─────` separator and resets the byte offset. Truncation/replace falls back to the same offset reset.
+
+**Why:** the user wants visibility into IDE-launched Claude Code sessions without reimplementing the rendering pipeline. Reusing the tab strip + xterm avoids a parallel rendering surface and keeps the DX consistent ("it's just another terminal"). The interactive `claude` tab (pty, auto-runs `claude\r`) and the observer `claude-live` tab (jsonl, read-only) coexist on every session.
+
+**How to apply:** when adding new tab kinds (e.g. log files, Render service logs, deploy output), add a new value to the `kind` discriminator and a corresponding source class — don't fork `TerminalPane`. Read-only tabs set `disableStdin` on xterm and skip the `onData` → ws bridge.
+
+### 2.5.4 Path encoding for transcript files: `/` AND `.` both become `-`
+
+**Claude Code escapes a working directory into its `~/.claude/projects/` directory name by replacing both `/` and `.` with `-`,** so `/Users/x/.worktrees/foo/feature` lands at `~/.claude/projects/-Users-x--worktrees-foo-feature/`. Note the double-dash from the leading-dot segments.
+
+**Why:** verified empirically by listing `~/.claude/projects/` on the user's machine before shipping the tailer (per advisor's pre-impl check). claude-control's `workingDirToProjectDir` only handles `/` → `-` and is buggy for any directory that lives under a hidden segment like `.worktrees` or `.claude`. Sequoias uses the corrected formula.
+
+**How to apply:** if Claude Code's encoding ever changes (e.g. lowercased, hash-prefixed, etc.), the failure mode is silent — the JSONL tab will say "no transcripts yet" forever. The recovery is `ls ~/.claude/projects/ | head` against a real working session and re-deriving the formula.
+
+### 2.5.5 Project IDs in URLs are FNV-1a 8-hex of the absolute path
+
+**Routes are keyed by `projectIdFor(absPath) = fnv1a32(absPath).toString(16).padStart(8, '0')`** — not by URL-encoded paths. State stays keyed by absolute path internally; the ID is derived on demand. The same FNV-1a hash already lives in `src/ports.ts` for service port allocation.
+
+**Why:** `/api/projects/%2FUsers%2Fggomes%2Fdev%2Ffoo/sessions/...` is brittle (any client that forgets to encode breaks). 8 hex chars are stable, short, and survive being typed into a URL bar by hand.
+
+**How to apply:** never rename a project's absolute path and expect the same ID. If the user moves a repo, the project disappears from the UI and a new entry appears with a new ID — fine for a personal tool, would need migration logic for a multi-user variant.
+
+### 2.5.6 Legacy single-project routes kept as soft aliases
+
+`/api/project`, `/api/sessions/:branch`, `/api/branches`, `/api/config`, `/api/project/terminals` continue to work — they resolve to the *first* project in `Object.values(store.data.projects)`. The id-keyed routes (`/api/projects/:id/...`) are the canonical surface and the UI uses them exclusively.
+
+**Why:** the e2e suite pre-dates project IDs and tests the legacy routes directly via raw HTTP. Migrating those tests to id-keyed URLs in the same change as the route restructure was deemed dead weight by the advisor (drop the alias layer). I kept them anyway because (a) the test fixture is a single-project setup so "first project" is unambiguous, and (b) the legacy alias is ~50 lines of mechanical delegation that doesn't bear any semantic load. Future cleanup: when a test or external client needs id-keyed routes, migrate that one and let the alias rot.
+
+**How to apply:** new routes go id-keyed only. Don't add new legacy aliases.
+
+### 2.5.7 Default active tab stays `claude`, not `claude-live`
+
+A first cut defaulted `<Terminal>` to the `claude-live` jsonl tab (because the new feature was the headline). Test 14 (terminal IO round-trip through xterm + WS) immediately broke: typing into a read-only tab does nothing.
+
+**Default active tab is `claude` (interactive pty).** The `claude-live` tab is a deliberate click — observer mode, used when Claude is being driven from somewhere else.
+
+**Why:** the user's primary mental model is "click a session, get a live shell." The IDE-coexistence feature is a secondary affordance; making it the default punishes the common case. Test 14 is a useful canary for this kind of regression.
+
+### 2.5.8 What was deliberately NOT borrowed from claude-control
+
+Per the plan, only `workingDirToProjectDir` (corrected) and `readJsonlTail` were ported. The following were considered and explicitly deferred:
+
+- **Process-tree-based discovery** (`ps`/`lsof`): unnecessary because hooks already tell us which worktrees have active Claude Code instances. Adding `ps` polling on top is duplicate state.
+- **Terminal-app integration** (AppleScript for Terminal.app/iTerm/Ghostty/etc.): out of scope; we have our own xterm tabs.
+- **Cost/token tracking, PR status badge polling, conversation preview cards, task summaries, desktop notifications, keyboard shortcuts (1-9 to select session)**: each of these is genuinely useful but expands scope. They are listed here so a future "make Sequoias more like claude-control" task starts from a known shortlist.
+- **Heuristic status classifier** (CPU + JSONL mtime fallback): the existing 60s pty-output fallback in `pty-manager.ts:130-137` covers the common "Stop hook missed" case; layering CPU sampling on top would obscure causality.
+
+---
+
+## 2.6 Port allocator out-of-range bug + PWA + UX polish (2026-05-08)
+
+### 2.6.1 The 4111 collision
+
+User hit `EADDRINUSE: address already in use 0.0.0.0:4111` running cortex against the `bug-fixes` worktree. State.json showed the worktree was assigned `api: 73753` — **above the 65535 TCP max**. cortex couldn't bind that port, fell back to the hardcoded default `4111`, which was already taken by the main checkout's cortex.
+
+**Root cause:** `src/ports.ts` `rangeFor()` used `slot = fnv1a32(service) % 100`, allowing fallback bands to start as high as `6000 + 99*1000 = 105000`. Any service whose hash slot was ≥ 60 produced an entirely invalid TCP range.
+
+**Fix:** cap slots to `Math.floor((MAX_TCP_PORT - FALLBACK_BAND_START + 1) / FALLBACK_BAND_SIZE)` (= 59 with current constants), so all bands stay in `[6000, 64999]`. Added a regression test (`rangeFor: every service name lands within TCP port range`) plus a 100-iteration property test on `basePort`.
+
+**Why this didn't bite earlier:** the original `cortex` and `ekoa_app` are explicit ranges (4000-4999 and 5000-5999). Only ad-hoc service names like `api`, `ui`, `ekoa_streaming_allowed_origins` hit the fallback hash; some happened to land in valid bands (`ui` → 13000s) and some didn't (`api` → 73000s). Plain bad luck on which keys appeared in the user's `.env` files.
+
+**How to apply:** existing sessions with ports > 65535 in state.json need re-allocation. Click the **Sync env** button on the affected session card — `resyncEnvFiles` re-allocates and rewrites the env files. New ports will differ from the old ones (different band) but are stable per `(branch, service)` from now on.
+
+### 2.6.2 Open-in-browser port chips
+
+Each port on the session card / main header is now a clickable chip linking to `http://<window.location.hostname>:<port>` in a new tab. Uses the page's hostname so it works correctly when accessed over Tailscale (the chip respects the same host the user is browsing from). Chrome opens the worktree's app; Safari does the same.
+
+**Design note:** chips render as `<key>:<value> ↗` (key dim, value bold, external-link icon). The colon is a real DOM node (`<span class="port-chip-sep">:</span>`) — initial implementation used a CSS `::after` pseudo-element, which Playwright's `toContainText` can't read because it tests `textContent`, not `innerText`. Test 2 (`creates a session with allocated ports`) regressed and surfaced this within minutes.
+
+### 2.6.3 xterm selection
+
+`TerminalPane`'s xterm theme now reads `--terminal-selection` and `--terminal-selection-inactive` from CSS vars. Selection was previously invisible because xterm fell back to its default which assumed black-on-white.
+
+### 2.6.4 PWA install
+
+Added `ui/public/manifest.webmanifest`, `ui/public/sw.js`, `ui/public/icon.svg`, manifest + apple-touch-icon meta in `index.html`, and SW registration in `main.tsx`. The service worker is intentionally minimal — it never intercepts `/api/`, `/ws/`, or `/_hook` (those are local-only and need to fail loudly when the server is down, not be cached). For other routes it does network-first with a 504 fallback. Sequoias is a local dashboard, so offline caching is anti-feature; the SW exists only to satisfy install criteria.
+
+**iOS gotcha:** Safari prefers PNG `apple-touch-icon` over SVG. The current SVG icon works in iOS but quality may suffer on older versions; a PNG fallback can be added later if it becomes a problem.
+
+### 2.6.5 ProjectTree expand/collapse race
+
+A `useEffect` was watching `[projects, collapsed]` and auto-expanding the first project whenever all projects were collapsed. This re-fired on every user click, undoing the collapse. Removed the effect entirely — initial state from `localStorage` is honored, and if all projects are collapsed by the user, we leave them collapsed.
+
+**Why:** the effect was a half-baked safeguard against "everything is collapsed and looks empty"; the actual UX problem it was solving (user opens app and sees an empty tree) is better handled by initializing collapsed state to empty (which `loadCollapsed()` already does on first load — localStorage is empty → empty Set → all expanded).
+
+---
+
 ## 3. Side-quests (not Sequoias work, captured for posterity)
 
 These were mid-session distractions resolved while building Sequoias. Not part of Sequoias' core history but worth recording so future-us doesn't re-investigate.

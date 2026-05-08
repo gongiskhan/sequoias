@@ -5,23 +5,48 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { registerRoutes } from './routes.js';
-import { loadStore, ensureProject } from './store.js';
+import { loadStore, ensureProject, resolveGlobalConfig } from './store.js';
 import { installHooks, restoreHooks } from './claude-hooks.js';
 import { PtyManager } from './pty-manager.js';
 
 export type ServerOptions = {
-  repoPath: string;
+  repoPath?: string;
   port: number;
   ide?: string;
+  host?: string;
 };
 
 export type RunningServer = {
   close(): Promise<void>;
+  host: string;
+  projectPaths: string[];
 };
 
 export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const store = await loadStore();
-  const project = ensureProject(store, opts.repoPath, opts.ide);
+
+  if (opts.repoPath) {
+    ensureProject(store, opts.repoPath, opts.ide);
+    const list = store.data.globalConfig?.projects || [];
+    if (!list.includes(opts.repoPath)) {
+      store.setGlobalConfig({ projects: [...list, opts.repoPath] });
+    }
+  }
+
+  const resolvedConfig = resolveGlobalConfig(store.data);
+  for (const p of resolvedConfig.projects) {
+    if (!store.data.projects[p]) {
+      try {
+        ensureProject(store, p);
+      } catch (err) {
+        process.stderr.write(
+          `warning: failed to load project ${p}: ${(err as Error).message}\n`,
+        );
+      }
+    }
+  }
+
+  const host = opts.host || resolvedConfig.host || '0.0.0.0';
 
   await installHooks(opts.port);
 
@@ -42,8 +67,6 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
 
   registerRoutes(app, {
     store,
-    project,
-    ide: opts.ide,
     ptyManager,
     serverPort: opts.port,
   });
@@ -53,12 +76,13 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     if (url.pathname === '/ws/terminal') {
       const branch = url.searchParams.get('branch');
       const terminal = url.searchParams.get('terminal') || 'claude';
+      const projectId = url.searchParams.get('project') || undefined;
       if (!branch) {
         socket.destroy();
         return;
       }
       wss.handleUpgrade(req, socket, head, (ws) => {
-        ptyManager.attach(branch, terminal, ws);
+        ptyManager.attach(branch, terminal, ws, projectId);
       });
     } else if (url.pathname === '/ws/events') {
       wss.handleUpgrade(req, socket, head, (ws) => {
@@ -77,13 +101,15 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
 
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(opts.port, '127.0.0.1', () => {
+    server.listen(opts.port, host, () => {
       server.off('error', reject);
       resolve();
     });
   });
 
   return {
+    host,
+    projectPaths: Object.keys(store.data.projects),
     async close() {
       ptyManager.killAll();
       wss.clients.forEach((c) => c.terminate());

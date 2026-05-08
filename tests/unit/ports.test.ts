@@ -38,6 +38,43 @@ test('rangeFor: unknown service falls into 6000+ band', () => {
   assert.equal(r.end - r.start, 999);
 });
 
+test('rangeFor: every service name lands within TCP port range', () => {
+  const samples = [
+    'api',
+    'ui',
+    'cortex',
+    'ekoa_app',
+    'auth',
+    'cdn',
+    'redis',
+    'pg',
+    'streaming',
+    'edge',
+    'admin',
+    'metrics',
+    'foo',
+    'bar',
+    'baz',
+    'webhooks',
+    'anything-with-very-long-name-here',
+    'ekoa_streaming_allowed_origins',
+  ];
+  for (const s of samples) {
+    const r = rangeFor(s);
+    assert.ok(
+      r.start >= 0 && r.end <= 65535,
+      `service "${s}" range ${r.start}-${r.end} exceeds TCP port range`,
+    );
+  }
+});
+
+test('basePort: arbitrary service stays within TCP range', () => {
+  for (let i = 0; i < 100; i++) {
+    const p = basePort(`branch-${i}`, `svc-${i}`);
+    assert.ok(p > 0 && p <= 65535, `port ${p} out of TCP range`);
+  }
+});
+
 test('allocatePort: linear-probes past in-use ports', async () => {
   const inUse = new Set<number>();
   // Force first 3 candidates to appear in use, then succeed.

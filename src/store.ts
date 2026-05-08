@@ -3,9 +3,40 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import { WebSocket } from 'ws';
 import { sequoiasDir, statePath } from './paths.js';
-import type { Project, Session, SessionStatus, State } from './types.js';
+import type {
+  GlobalConfig,
+  Project,
+  ResolvedGlobalConfig,
+  Session,
+  SessionStatus,
+  State,
+} from './types.js';
+import { fnv1a32 } from './ports.js';
 
 const EMPTY_STATE: State = { version: 1, projects: {} };
+
+export const DEFAULT_GLOBAL_CONFIG: ResolvedGlobalConfig = {
+  theme: 'system',
+  idePath: '',
+  projects: [],
+  host: '0.0.0.0',
+};
+
+export function resolveGlobalConfig(
+  state: Pick<State, 'globalConfig'>,
+): ResolvedGlobalConfig {
+  const g = state.globalConfig || {};
+  return {
+    theme: g.theme || DEFAULT_GLOBAL_CONFIG.theme,
+    idePath: g.idePath || DEFAULT_GLOBAL_CONFIG.idePath,
+    projects: g.projects ? [...g.projects] : [],
+    host: g.host || DEFAULT_GLOBAL_CONFIG.host,
+  };
+}
+
+export function projectIdFor(absPath: string): string {
+  return fnv1a32(absPath).toString(16).padStart(8, '0');
+}
 
 export type Store = {
   data: State;
@@ -20,6 +51,8 @@ export type Store = {
   upsertSession(projectPath: string, session: Session): void;
   removeSession(projectPath: string, branch: string): void;
   getProject(projectPath: string): Project | undefined;
+  getProjectById(id: string): Project | undefined;
+  setGlobalConfig(patch: Partial<GlobalConfig>): ResolvedGlobalConfig;
   subscribe(ws: WebSocket): void;
   broadcast(msg: unknown): void;
 };
@@ -90,6 +123,19 @@ export async function loadStore(): Promise<Store> {
     },
     getProject(projectPath: string) {
       return data.projects[projectPath];
+    },
+    getProjectById(id: string) {
+      for (const p of Object.values(data.projects)) {
+        if (projectIdFor(p.path) === id) return p;
+      }
+      return undefined;
+    },
+    setGlobalConfig(patch: Partial<GlobalConfig>) {
+      data.globalConfig = { ...(data.globalConfig || {}), ...patch };
+      const resolved = resolveGlobalConfig(data);
+      void this.save();
+      this.broadcast({ type: 'global-config-changed', config: resolved });
+      return resolved;
     },
     upsertSession(projectPath: string, session: Session) {
       const project = data.projects[projectPath];

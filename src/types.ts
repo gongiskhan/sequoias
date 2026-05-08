@@ -35,7 +35,24 @@ export type Project = {
   terminals?: StoredTerminal[];
 };
 
+export type ThemePreference = 'dark' | 'light' | 'system';
+
+export type GlobalConfig = {
+  theme?: ThemePreference;
+  idePath?: string;
+  projects?: string[];
+  host?: string;
+};
+
+export type ResolvedGlobalConfig = {
+  theme: ThemePreference;
+  idePath: string;
+  projects: string[];
+  host: string;
+};
+
 export type State = {
   version: 1;
+  globalConfig?: GlobalConfig;
   projects: Record<string, Project>;
 };

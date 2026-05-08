@@ -2,7 +2,7 @@ import React, { useEffect, useState, useCallback } from 'react';
 import type { Session } from '../types.js';
 import { StatusBadge } from './StatusBadge.js';
 import { TerminalPane } from './TerminalPane.js';
-import { Play, RotateCcw, Square } from 'lucide-react';
+import { Play, RotateCcw, Square, Eye, ExternalLink } from 'lucide-react';
 
 type TerminalDef = {
   name: string;
@@ -10,25 +10,36 @@ type TerminalDef = {
   cmd: string | null;
   autostart: boolean;
   background: boolean;
+  kind?: 'pty' | 'jsonl';
+  readOnly?: boolean;
   running?: boolean;
 };
 
-export function Terminal({ session }: { session: Session }): JSX.Element {
+type Props = {
+  session: Session;
+  projectId?: string;
+};
+
+export function Terminal({ session, projectId }: Props): JSX.Element {
   const [terminals, setTerminals] = useState<TerminalDef[]>([]);
   const [active, setActive] = useState<string>('claude');
   const [mounted, setMounted] = useState<Set<string>>(new Set(['claude']));
   const [refreshKey, setRefreshKey] = useState<Record<string, number>>({});
 
+  const baseUrl = projectId
+    ? `/api/projects/${projectId}/sessions/${encodeURIComponent(session.branch)}`
+    : `/api/sessions/${encodeURIComponent(session.branch)}`;
+
   const refresh = useCallback(async () => {
     try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(session.branch)}/terminals`);
+      const res = await fetch(`${baseUrl}/terminals`);
       if (!res.ok) return;
       const body = await res.json();
       setTerminals(body.terminals.filter((t: TerminalDef) => !t.background));
     } catch {
       // ignore
     }
-  }, [session.branch]);
+  }, [baseUrl]);
 
   useEffect(() => {
     void refresh();
@@ -50,11 +61,16 @@ export function Terminal({ session }: { session: Session }): JSX.Element {
     });
   }, [active]);
 
+  useEffect(() => {
+    if (terminals.length === 0) return;
+    if (terminals.some((t) => t.name === active)) return;
+    setActive(terminals[0].name);
+  }, [terminals, active]);
+
   const restart = async (name: string) => {
-    await fetch(
-      `/api/sessions/${encodeURIComponent(session.branch)}/terminals/${encodeURIComponent(name)}/restart`,
-      { method: 'POST' },
-    );
+    await fetch(`${baseUrl}/terminals/${encodeURIComponent(name)}/restart`, {
+      method: 'POST',
+    });
     setRefreshKey((prev) => ({ ...prev, [name]: (prev[name] || 0) + 1 }));
     setMounted((prev) => {
       const next = new Set(prev);
@@ -66,10 +82,9 @@ export function Terminal({ session }: { session: Session }): JSX.Element {
   };
 
   const kill = async (name: string) => {
-    await fetch(
-      `/api/sessions/${encodeURIComponent(session.branch)}/terminals/${encodeURIComponent(name)}/kill`,
-      { method: 'POST' },
-    );
+    await fetch(`${baseUrl}/terminals/${encodeURIComponent(name)}/kill`, {
+      method: 'POST',
+    });
     await refresh();
   };
 
@@ -78,70 +93,97 @@ export function Terminal({ session }: { session: Session }): JSX.Element {
       <header className="main-header">
         <span className="branch-name">{session.branch}</span>
         <StatusBadge status={session.lastStatus} />
-        <span className="ports" style={{ marginLeft: 'auto' }}>
-          {Object.entries(session.ports).map(([k, v]) => `${k}:${v}`).join('  ')}
-        </span>
+        <div className="ports" style={{ marginLeft: 'auto' }}>
+          {Object.entries(session.ports).map(([k, v]) => (
+            <a
+              key={k}
+              className="port-chip"
+              href={`http://${window.location.hostname}:${v}`}
+              target="_blank"
+              rel="noreferrer"
+              title={`Open ${k} (port ${v}) in a new tab`}
+            >
+              <span className="port-chip-key">{k}</span>
+              <span className="port-chip-sep">:</span>
+              <span className="port-chip-value">{v}</span>
+              <ExternalLink size={11} className="port-chip-icon" />
+            </a>
+          ))}
+        </div>
       </header>
       <div className="terminal-tabs" data-testid="terminal-tabs">
-        {terminals.map((t) => (
-          <div
-            key={t.name}
-            className={`terminal-tab ${active === t.name ? 'active' : ''}`}
-            onClick={() => setActive(t.name)}
-            data-testid={`tab-${t.name}`}
-          >
-            <span className={`tab-dot ${t.running ? 'running' : 'stopped'}`} />
-            <span className="tab-name">{t.name}</span>
-            {t.running ? (
-              <>
+        {terminals.map((t) => {
+          const isJsonl = t.kind === 'jsonl';
+          return (
+            <div
+              key={t.name}
+              className={`terminal-tab ${active === t.name ? 'active' : ''}`}
+              onClick={() => setActive(t.name)}
+              data-testid={`tab-${t.name}`}
+            >
+              {isJsonl ? (
+                <Eye size={11} className="tab-eye" />
+              ) : (
+                <span className={`tab-dot ${t.running ? 'running' : 'stopped'}`} />
+              )}
+              <span className="tab-name">{t.name}</span>
+              {!isJsonl && t.running && (
+                <>
+                  <button
+                    className="tab-icon-btn"
+                    title={`Restart ${t.name}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void restart(t.name);
+                    }}
+                    data-testid={`tab-restart-${t.name}`}
+                  >
+                    <RotateCcw size={11} />
+                  </button>
+                  <button
+                    className="tab-icon-btn"
+                    title={`Stop ${t.name}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void kill(t.name);
+                    }}
+                    data-testid={`tab-kill-${t.name}`}
+                  >
+                    <Square size={11} />
+                  </button>
+                </>
+              )}
+              {!isJsonl && !t.running && (
                 <button
-                  className="tab-icon-btn"
-                  title={`Restart ${t.name}`}
+                  className="tab-icon-btn tab-start-btn"
+                  title={`Start ${t.name}`}
                   onClick={(e) => {
                     e.stopPropagation();
                     void restart(t.name);
                   }}
-                  data-testid={`tab-restart-${t.name}`}
+                  data-testid={`tab-start-${t.name}`}
                 >
-                  <RotateCcw size={11} />
+                  <Play size={11} />
                 </button>
-                <button
-                  className="tab-icon-btn"
-                  title={`Stop ${t.name}`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    void kill(t.name);
-                  }}
-                  data-testid={`tab-kill-${t.name}`}
-                >
-                  <Square size={11} />
-                </button>
-              </>
-            ) : (
-              <button
-                className="tab-icon-btn tab-start-btn"
-                title={`Start ${t.name}`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  void restart(t.name);
-                }}
-                data-testid={`tab-start-${t.name}`}
-              >
-                <Play size={11} />
-              </button>
-            )}
-          </div>
-        ))}
+              )}
+            </div>
+          );
+        })}
       </div>
       <div className="terminal-host" data-testid="terminal-host">
-        {Array.from(mounted).map((name) => (
-          <TerminalPane
-            key={`${name}::${refreshKey[name] || 0}`}
-            branch={session.branch}
-            terminalName={name}
-            active={active === name}
-          />
-        ))}
+        {Array.from(mounted).map((name) => {
+          const def = terminals.find((t) => t.name === name);
+          return (
+            <TerminalPane
+              key={`${name}::${refreshKey[name] || 0}`}
+              branch={session.branch}
+              terminalName={name}
+              projectId={projectId}
+              active={active === name}
+              readOnly={def?.readOnly}
+            />
+          );
+        })}
       </div>
     </>
   );

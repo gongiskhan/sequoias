@@ -338,7 +338,7 @@ test('11. hooks are restored byte-identical on shutdown', async () => {
   env.SEQUOIAS_AUTO_CLAUDE = '0';
   const proc = spawn(
     process.execPath,
-    [path.resolve('dist/server/cli.js'), repoPath, '--port', String(port)],
+    [path.resolve('dist/server/cli.js'), repoPath, '--port', String(port), '--host', '127.0.0.1'],
     { cwd: path.resolve('.'), env, stdio: ['ignore', 'pipe', 'pipe'] },
   );
   // Wait for ready
@@ -397,7 +397,7 @@ test('12. survives server restart with sessions intact', async () => {
   env.SEQUOIAS_AUTO_CLAUDE = '0';
   const proc = spawn(
     process.execPath,
-    [path.resolve('dist/server/cli.js'), fx.repoPath, '--port', String(port)],
+    [path.resolve('dist/server/cli.js'), fx.repoPath, '--port', String(port), '--host', '127.0.0.1'],
     { cwd: path.resolve('.'), env, stdio: ['ignore', 'pipe', 'pipe'] },
   );
   await waitForLocalPort(port);
@@ -462,6 +462,260 @@ test('14. terminal IO round-trips through xterm and WS', async ({ page }) => {
   await expect(page.locator('.xterm-screen')).toContainText('hello-from-test-7c9d', {
     timeout: 8000,
   });
+});
+
+test('15. global config round-trips through PATCH /api/global-config', async () => {
+  await new Promise<void>((resolve, reject) => {
+    const body = JSON.stringify({ theme: 'dark', idePath: 'rebased' });
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port: fx.serverPort,
+        method: 'PATCH',
+        path: '/api/global-config',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        res.on('data', () => undefined);
+        res.on('end', () => {
+          expect(res.statusCode).toBe(200);
+          resolve();
+        });
+      },
+    );
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+
+  const fetched = await new Promise<any>((resolve, reject) => {
+    http.get(
+      { host: '127.0.0.1', port: fx.serverPort, path: '/api/global-config' },
+      (res) => {
+        let d = '';
+        res.on('data', (c) => (d += c));
+        res.on('end', () => resolve(JSON.parse(d)));
+      },
+    ).on('error', reject);
+  });
+  expect(fetched.theme).toBe('dark');
+  expect(fetched.idePath).toBe('rebased');
+
+  // Verify it is persisted to state.json
+  const stateRaw = fs.readFileSync(
+    path.join(fx.tmpHome, '.sequoias', 'state.json'),
+    'utf8',
+  );
+  const parsed = JSON.parse(stateRaw);
+  expect(parsed.globalConfig.theme).toBe('dark');
+  expect(parsed.globalConfig.idePath).toBe('rebased');
+});
+
+test('16. multi-project: POST /api/projects adds a second project', async () => {
+  const fsp = await import('node:fs/promises');
+  const { execa } = await import('execa');
+  const tmpHomeBase = path.dirname(fx.tmpHome);
+  const repo2 = await fsp.mkdtemp(path.join(tmpHomeBase, 'sequoias-repo2-'));
+  await execa('git', ['init', '-q', '-b', 'main'], { cwd: repo2 });
+  await execa('git', ['config', 'user.email', 't@t'], { cwd: repo2 });
+  await execa('git', ['config', 'user.name', 't'], { cwd: repo2 });
+  await fsp.writeFile(path.join(repo2, 'README.md'), 'x');
+  await execa('git', ['add', '.'], { cwd: repo2 });
+  await execa('git', ['commit', '-q', '-m', 'init'], { cwd: repo2 });
+
+  const result = await new Promise<{ status: number; body: any }>((resolve, reject) => {
+    const body = JSON.stringify({ path: repo2 });
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port: fx.serverPort,
+        method: 'POST',
+        path: '/api/projects',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        let d = '';
+        res.on('data', (c) => (d += c));
+        res.on('end', () => {
+          try { resolve({ status: res.statusCode || 0, body: JSON.parse(d) }); }
+          catch { resolve({ status: res.statusCode || 0, body: { raw: d } }); }
+        });
+      },
+    );
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+  expect(result.status).toBe(200);
+  expect(result.body.id).toMatch(/^[0-9a-f]{8}$/);
+
+  const state = await new Promise<any>((resolve, reject) => {
+    http.get(
+      { host: '127.0.0.1', port: fx.serverPort, path: '/api/state' },
+      (res) => {
+        let d = '';
+        res.on('data', (c) => (d += c));
+        res.on('end', () => resolve(JSON.parse(d)));
+      },
+    ).on('error', reject);
+  });
+  expect(Object.keys(state.projects).length).toBe(2);
+  expect(state.projects[fx.repoPath]).toBeTruthy();
+  expect(state.projects[repo2]).toBeTruthy();
+  expect(state.globalConfig.projects).toEqual(
+    expect.arrayContaining([fx.repoPath, repo2]),
+  );
+
+  await fsp.rm(repo2, { recursive: true, force: true });
+});
+
+test('17. JSONL tab streams formatted events from the active transcript', async () => {
+  const fsp = await import('node:fs/promises');
+  const branch = 'feature/jsonl';
+  const result = await createSessionViaApi(branch);
+  expect(result.status).toBe(200);
+
+  const wtPath = path.join(
+    fx.tmpHome,
+    '.worktrees',
+    path.basename(fx.repoPath),
+    'feature-jsonl',
+  );
+
+  // Compose the same path encoding as the server: replace both / and . with -.
+  const escaped = wtPath.replace(/[/.]/g, '-');
+  const projectDir = path.join(fx.tmpHome, '.claude', 'projects', escaped);
+  await fsp.mkdir(projectDir, { recursive: true });
+  const transcriptFile = path.join(projectDir, 'sess-1.jsonl');
+  await fsp.writeFile(
+    transcriptFile,
+    [
+      JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: 'jsonl-tab-probe-9f3' },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'jsonl-response-token-7c2' }],
+        },
+      }),
+      '',
+    ].join('\n'),
+  );
+
+  // Connect the WS terminal stream for the claude-live tab.
+  const { WebSocket } = await import('ws');
+  const ws = new WebSocket(
+    `ws://127.0.0.1:${fx.serverPort}/ws/terminal?branch=${encodeURIComponent(branch)}&terminal=claude-live`,
+  );
+  const chunks: string[] = [];
+  await new Promise<void>((resolve, reject) => {
+    ws.on('open', () => resolve());
+    ws.on('error', reject);
+    setTimeout(() => reject(new Error('ws open timeout')), 4000);
+  });
+  ws.on('message', (data) => {
+    chunks.push(data.toString());
+  });
+
+  // Wait up to 5s for both probe strings to surface.
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const joined = chunks.join('');
+    if (joined.includes('jsonl-tab-probe-9f3') && joined.includes('jsonl-response-token-7c2')) {
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  ws.close();
+  const joined = chunks.join('');
+  expect(joined).toContain('jsonl-tab-probe-9f3');
+  expect(joined).toContain('jsonl-response-token-7c2');
+});
+
+test('18. JSONL tab lazy-spawns for sessions loaded from state on restart', async () => {
+  // Create a session, then restart the server. The session is loaded from
+  // state.json with lastStatus=dead and no in-memory entries. Connecting to
+  // claude-live should still work — it must lazy-spawn on attach.
+  const fsp = await import('node:fs/promises');
+  const branch = 'feature/lazy-jsonl';
+  const result = await createSessionViaApi(branch);
+  expect(result.status).toBe(200);
+
+  const wtPath = path.join(
+    fx.tmpHome,
+    '.worktrees',
+    path.basename(fx.repoPath),
+    'feature-lazy-jsonl',
+  );
+  const escaped = wtPath.replace(/[/.]/g, '-');
+  const projectDir = path.join(fx.tmpHome, '.claude', 'projects', escaped);
+  await fsp.mkdir(projectDir, { recursive: true });
+  await fsp.writeFile(
+    path.join(projectDir, 'sess.jsonl'),
+    JSON.stringify({
+      type: 'user',
+      message: { role: 'user', content: 'lazy-jsonl-token-4dx' },
+    }) + '\n',
+  );
+
+  // Restart the server pointed at the same HOME / repo.
+  fx.serverProc.kill('SIGTERM');
+  await new Promise<void>((resolve) => {
+    fx.serverProc.on('exit', () => resolve());
+    setTimeout(() => resolve(), 4000);
+  });
+  const port = fx.serverPort + 2000;
+  const { spawn } = await import('node:child_process');
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (typeof v === 'string') env[k] = v;
+  }
+  env.HOME = fx.tmpHome;
+  env.SEQUOIAS_AUTO_CLAUDE = '0';
+  const proc = spawn(
+    process.execPath,
+    [path.resolve('dist/server/cli.js'), fx.repoPath, '--port', String(port), '--host', '127.0.0.1'],
+    { cwd: path.resolve('.'), env, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  await waitForLocalPort(port);
+
+  const { WebSocket } = await import('ws');
+  const ws = new WebSocket(
+    `ws://127.0.0.1:${port}/ws/terminal?branch=${encodeURIComponent(branch)}&terminal=claude-live`,
+  );
+  const chunks: string[] = [];
+  await new Promise<void>((resolve, reject) => {
+    ws.on('open', () => resolve());
+    ws.on('error', reject);
+    setTimeout(() => reject(new Error('ws open timeout')), 4000);
+  });
+  ws.on('message', (data) => {
+    chunks.push(data.toString());
+  });
+
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    if (chunks.join('').includes('lazy-jsonl-token-4dx')) break;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  ws.close();
+  expect(chunks.join('')).toContain('lazy-jsonl-token-4dx');
+
+  proc.kill('SIGTERM');
+  await new Promise<void>((resolve) => {
+    proc.on('exit', () => resolve());
+    setTimeout(() => resolve(), 4000);
+  });
+  fx.serverProc = proc;
 });
 
 async function waitForLocalPort(port: number, timeoutMs = 8000): Promise<void> {

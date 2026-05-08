@@ -1,8 +1,13 @@
 import type { StoredTerminal } from './types.js';
 
-export type TerminalConfig = StoredTerminal;
+export type TerminalKind = 'pty' | 'jsonl';
 
-const RESERVED_NAMES = new Set(['claude']);
+export type TerminalConfig = StoredTerminal & {
+  kind?: TerminalKind;
+  readOnly?: boolean;
+};
+
+const RESERVED_NAMES = new Set(['claude', 'claude-live']);
 const NAME_RE = /^[a-z][a-z0-9-]{0,30}$/i;
 
 export function validateTerminals(input: unknown): StoredTerminal[] {
@@ -39,12 +44,26 @@ export function validateTerminals(input: unknown): StoredTerminal[] {
 }
 
 export function resolveTerminals(stored: StoredTerminal[] | undefined): TerminalConfig[] {
+  const liveTerminal: TerminalConfig = {
+    name: 'claude-live',
+    cwd: '.',
+    cmd: null,
+    autostart: true,
+    background: false,
+    kind: 'jsonl',
+    readOnly: true,
+  };
   const claudeTerminal: TerminalConfig = {
     name: 'claude',
     cwd: '.',
     cmd: process.env.SEQUOIAS_AUTO_CLAUDE === '0' ? null : 'claude',
     autostart: true,
     background: false,
+    kind: 'pty',
   };
-  return [claudeTerminal, ...(stored || [])];
+  return [
+    liveTerminal,
+    claudeTerminal,
+    ...(stored || []).map((t) => ({ ...t, kind: 'pty' as TerminalKind })),
+  ];
 }
