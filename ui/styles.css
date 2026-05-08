@@ -441,8 +441,8 @@ a:hover { text-decoration: underline; }
 .icon-btn {
   border: 1px solid var(--border-strong);
   background: var(--bg-card);
-  width: 34px;
-  height: 34px;
+  width: 38px;
+  height: 38px;
   display: inline-flex;
   align-items: center;
   justify-content: center;

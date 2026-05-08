@@ -25,7 +25,7 @@ export function ThemeToggle({ value, onChange }: Props): JSX.Element {
       data-testid="theme-toggle"
       aria-label={`theme ${label}`}
     >
-      <Icon size={16} />
+      <Icon size={18} />
     </button>
   );
 }

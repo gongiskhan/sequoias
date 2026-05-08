@@ -114,7 +114,10 @@ test('2. creates a session with allocated ports', async ({ page }) => {
 
   const card = page.locator('[data-testid="session-card-feature/auth"]');
   await expect(card).toBeVisible({ timeout: 8000 });
-  await expect(card.locator('.ports')).toContainText(/cortex:\d+/);
+  await card.locator('.branch-name').click();
+  await expect(page.locator('.main-header .ports')).toContainText(/cortex:\d+/, {
+    timeout: 4000,
+  });
 
   expect(
     worktreeExists(fx.tmpHome, fx.repoPath, 'feature-auth'),

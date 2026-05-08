@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, Plus, Settings as SettingsIcon } from 'lucide-react';
 import type { Project, Session, State } from '../types.js';
 import { StatusBadge } from './StatusBadge.js';
-import { Code2, GitPullRequest, RefreshCcw, Trash2, ExternalLink } from 'lucide-react';
+import { Code2, GitPullRequest, RefreshCcw, Trash2 } from 'lucide-react';
 
 const STATUS_PRIORITY: Record<string, number> = {
   waiting: 0,
@@ -155,7 +155,7 @@ function ProjectGroup({
           data-testid={`project-settings-${project.name}`}
           aria-label={`Project terminals for ${project.name}`}
         >
-          <SettingsIcon size={15} />
+          <SettingsIcon size={18} />
         </button>
       </div>
       {!isCollapsed && (
@@ -222,7 +222,6 @@ function SessionCard({
   onResyncEnv: Props['onResyncEnv'];
 }): JSX.Element {
   const [busy, setBusy] = useState(false);
-  const portEntries = Object.entries(session.ports);
 
   const stop = (e: React.MouseEvent) => e.stopPropagation();
 
@@ -247,26 +246,6 @@ function SessionCard({
         <span className="branch-name">{session.branch}</span>
         <StatusBadge status={session.lastStatus} />
       </div>
-      {portEntries.length > 0 && (
-        <div className="ports" onClick={stop}>
-          {portEntries.map(([k, v]) => (
-            <a
-              key={k}
-              className="port-chip"
-              href={`http://${window.location.hostname}:${v}`}
-              target="_blank"
-              rel="noreferrer"
-              title={`Open ${k} (port ${v}) in a new tab`}
-              data-testid={`port-chip-${session.branch}-${k}`}
-            >
-              <span className="port-chip-key">{k}</span>
-              <span className="port-chip-sep">:</span>
-              <span className="port-chip-value">{v}</span>
-              <ExternalLink size={11} className="port-chip-icon" />
-            </a>
-          ))}
-        </div>
-      )}
       {session.prUrl && (
         <a
           className="pr-link"

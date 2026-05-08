@@ -337,7 +337,7 @@ export function App(): JSX.Element {
               data-testid="global-settings-btn"
               aria-label="Global settings"
             >
-              <Settings size={16} />
+              <Settings size={18} />
             </button>
           </div>
         </header>
