@@ -231,6 +231,44 @@ A `useEffect` was watching `[projects, collapsed]` and auto-expanding the first 
 
 ---
 
+## 2.7 Auto-heal of invalid ports + sequoia visual identity (2026-05-08, second session)
+
+### 2.7.1 The 4111 collision returned
+
+Previous fix (2.6.1) capped the allocator to valid TCP range, but the user's existing sessions in state.json still had stale invalid ports (`api: 73512`, `api: 73753`) and the env files inside the worktrees still pointed at those invalid values. The user hit the same EADDRINUSE 4111 because cortex's bind on the invalid port was failing and falling back to its hardcoded 4111 default.
+
+**Fix:** server startup now scans all loaded sessions for any port > 65535 (or ≤ 0) and runs `resyncEnvFiles({ forceRecopy: true })` on them. Two changes in `worktree.ts` were required:
+
+1. **forceRecopy option.** `resyncEnvFiles` previously only copied env files from the main checkout when the worktree was missing them. For healing, we need to overwrite the worktree's stale files with the main version, then run the rewriter on a clean slate.
+2. **Extended port map for the rewriter.** The rewriter only substitutes URL ports that match a port in the *main* checkout's port map. URLs in the worktree already pointing at old worktree-allocated ports (e.g. `localhost:73512`) wouldn't match. We now build an `extendedMap` that includes both the main port map AND the session's existing (possibly stale) ports → service map, so URLs at any of those values get rewritten.
+
+**Why:** without the extension, healing the `API_PORT=73512` line worked, but `NEXT_PUBLIC_API_URL=http://localhost:73512` stayed broken — and *that* is what apps actually read at runtime.
+
+**How to apply:** the auto-heal runs once per server start. If it can't reach a worktree (deleted on disk), it logs a warning and continues. Don't make this destructive — never delete env file contents the user may have customized; the rewriter only touches recognized port numbers and matching URL fragments.
+
+### 2.7.2 Sequoia visual identity
+
+Replaced the cool-blue/charcoal-steel palette with a sequoia-grove visual language:
+
+- **Dark theme**: warm forest greens for surfaces (#161E1A bg, #1C2620 rail, #253028 cards), bark orange for accent (#D08960). Reads as "forest at dusk" rather than "tech dashboard at night."
+- **Light theme**: parchment cream (#EFE8DA) instead of cool grey-white. Pure white cards float on the parchment — strong visual hierarchy. Deep forest text (#1F2A22) gives a verified 11.6:1 contrast ratio against parchment, well above WCAG AAA. Accent is deep redwood (#8B4A2B).
+- **Brand mark**: replaced the dot+wordmark with a sequoia silhouette (4-cluster canopy + bark trunk, two-tone gradient) plus an italic-serif "Sequoias" wordmark (Newsreader / Source Serif Pro). Reads like National Park Service signage — deliberate without being twee.
+- **Typography**: JetBrains Mono first in mono stack (was just `ui-monospace`). Body sans unchanged. Italic serif for brand/dialog headings adds texture.
+- **Terminal**: dark theme uses dark forest (#11181C, slightly cooler than rail to keep terminal text crisp); light theme uses warm cream (#F8F3E8). Selection at 40% accent in dark, 22% in light — much more visible than xterm's default.
+- **Status badges, port chips, action buttons**: each gets a bordered pill style with semantically-tinted backgrounds (amber-soft for waiting, green-soft for working, redwood-red-soft for errored).
+
+**Why italic serif for the wordmark instead of geometric sans?** Most productivity dashboards use cool geometric type (Inter, GT America, Söhne). The italic serif is a deliberate counter-signal — sequoias are old, the National Parks are old, and the brand mark should feel rooted, not optimized. It's one of the few places where the "120% on a single detail" rule pays off.
+
+**Skipped on purpose**: framer-motion (no new dependency for a productivity app), gradient-y hover effects (slop territory), per-component icons in headings (slop), drop-shadows on every card. Card depth comes from background contrast alone, not shadow stacking.
+
+### 2.7.3 Click semantics on session cards
+
+Port chips inside session cards stop event propagation so a chip click opens the URL without selecting the session, while a click on any other part of the card selects the session and opens its terminal. Visual hint: hovering a chip recolors it to the bark accent; hovering the card body shifts the bg subtly.
+
+**How to apply:** when adding new clickable elements inside the card (not via `<a>`), wrap them in `onClick={stop}` if you don't want the parent select to fire.
+
+---
+
 ## 3. Side-quests (not Sequoias work, captured for posterity)
 
 These were mid-session distractions resolved while building Sequoias. Not part of Sequoias' core history but worth recording so future-us doesn't re-investigate.

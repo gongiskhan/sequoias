@@ -316,7 +316,8 @@ export function App(): JSX.Element {
       <aside className={`rail ${drawerOpen ? 'drawer-open' : ''}`}>
         <header className="rail-header">
           <div className="rail-brand">
-            <span className="rail-brand-dot" /> Sequoias
+            <img className="rail-brand-mark" src="/icon.svg" alt="" aria-hidden="true" />
+            <span className="rail-brand-name">Sequoias</span>
           </div>
           <div className="rail-header-actions">
             <ThemeToggle

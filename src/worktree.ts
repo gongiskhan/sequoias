@@ -139,28 +139,44 @@ export async function resyncEnvFiles(args: {
   worktreePath: string;
   branch: string;
   existingPorts: Record<string, number>;
+  forceRecopy?: boolean;
 }): Promise<{ envFiles: string[]; ports: Record<string, number>; copiedFiles: string[] }> {
-  const { repoPath, worktreePath, branch, existingPorts } = args;
+  const { repoPath, worktreePath, branch, existingPorts, forceRecopy } = args;
   const mainEnvFiles = await discoverEnvFiles(repoPath);
   const mainPortMap = readMainPortMap(repoPath, mainEnvFiles);
 
-  const reserved = new Set<number>(Object.values(existingPorts));
+  // Don't lock allocator to old (possibly invalid) ports — we want fresh,
+  // valid allocations. Reserved is empty; the allocator's own deterministic
+  // hash + linear-probe handles uniqueness.
+  const reserved = new Set<number>();
   const copiedFiles: string[] = [];
 
   for (const rel of mainEnvFiles) {
     const src = path.join(repoPath, rel);
     const dst = path.join(worktreePath, rel);
     if (!fs.existsSync(src)) continue;
-    if (!fs.existsSync(dst)) {
+    if (!fs.existsSync(dst) || forceRecopy) {
       await fsp.mkdir(path.dirname(dst), { recursive: true });
       await fsp.copyFile(src, dst);
       copiedFiles.push(rel);
     }
   }
 
+  // Extend mainPortMap with the worktree's existing (possibly stale) port
+  // values, so URLs already pointing to old worktree ports also get rewritten
+  // to the new ones. Without this, healing an out-of-range port (e.g. 73512)
+  // updates `.env`'s `API_PORT=` line but leaves `NEXT_PUBLIC_API_URL=...:73512`
+  // unchanged.
+  const extendedMap: typeof mainPortMap = { ...mainPortMap };
+  for (const [service, port] of Object.entries(existingPorts)) {
+    if (!extendedMap[port]) {
+      extendedMap[port] = { service, key: `${service.toUpperCase()}_PORT` };
+    }
+  }
+
   const { ports } = await rewriteEnvFiles(worktreePath, mainEnvFiles, {
     branch,
-    mainPortMap,
+    mainPortMap: extendedMap,
     reserved,
   });
 

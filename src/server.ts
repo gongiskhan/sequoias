@@ -8,6 +8,9 @@ import { registerRoutes } from './routes.js';
 import { loadStore, ensureProject, resolveGlobalConfig } from './store.js';
 import { installHooks, restoreHooks } from './claude-hooks.js';
 import { PtyManager } from './pty-manager.js';
+import { resyncEnvFiles } from './worktree.js';
+
+const MAX_TCP_PORT = 65535;
 
 export type ServerOptions = {
   repoPath?: string;
@@ -45,6 +48,42 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       }
     }
   }
+
+  // Auto-heal sessions whose stored ports exceed the TCP range. Pre-fix builds
+  // of the allocator could land services in bands up to 105000; their env files
+  // have invalid port values that bind would reject, and apps fall back to
+  // hardcoded defaults that collide with the main checkout.
+  for (const [projectPath, project] of Object.entries(store.data.projects)) {
+    for (const session of Object.values(project.sessions)) {
+      const bad = Object.entries(session.ports).filter(
+        ([, v]) => !Number.isFinite(v) || v <= 0 || v > MAX_TCP_PORT,
+      );
+      if (bad.length === 0) continue;
+      try {
+        const result = await resyncEnvFiles({
+          repoPath: project.path,
+          worktreePath: session.worktreePath,
+          branch: session.branch,
+          existingPorts: session.ports,
+          forceRecopy: true,
+        });
+        session.ports = result.ports;
+        session.envFiles = result.envFiles;
+        process.stdout.write(
+          `auto-healed ${session.branch}: invalid ports (${bad
+            .map(([k, v]) => `${k}=${v}`)
+            .join(', ')}) -> ${Object.entries(result.ports)
+            .map(([k, v]) => `${k}=${v}`)
+            .join(', ')}\n`,
+        );
+      } catch (err) {
+        process.stderr.write(
+          `warning: failed to auto-heal ${projectPath}#${session.branch}: ${(err as Error).message}\n`,
+        );
+      }
+    }
+  }
+  await store.flush();
 
   const host = opts.host || resolvedConfig.host || '0.0.0.0';
 
