@@ -722,6 +722,103 @@ test('18. JSONL tab lazy-spawns for sessions loaded from state on restart', asyn
   fx.serverProc = proc;
 });
 
+test('19. claude --continue respawns and survives old pty exit', async () => {
+  // Regression: the kill+spawn flow in /claude-continue raced the old pty's
+  // onExit callback. The OLD pty's exit handler delete()'d byKey by key —
+  // which, after the synchronous respawn, pointed at the NEW entry — and
+  // setSessionStatus to 'dead', clobbering the new pty's bookkeeping.
+  // After the fix the onExit is guarded by `byKey.get(key) === entry`.
+  const branch = 'feature/continue';
+  const created = await createSessionViaApi(branch);
+  expect(created.status).toBe(200);
+
+  // Wait for the initial claude pty to spawn.
+  await new Promise((r) => setTimeout(r, 400));
+
+  const continueRes = await new Promise<number>((resolve, reject) => {
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port: fx.serverPort,
+        method: 'POST',
+        path: `/api/sessions/${encodeURIComponent(branch)}/claude-continue`,
+      },
+      (res) => {
+        res.on('data', () => undefined);
+        res.on('end', () => resolve(res.statusCode || 0));
+      },
+    );
+    req.on('error', reject);
+    req.end();
+  });
+  expect(continueRes).toBe(200);
+
+  // Give the old pty's onExit room to fire AFTER the synchronous respawn.
+  // Without the race-guard, this is when the new entry would get deleted
+  // and status would flip to 'dead'.
+  await new Promise((r) => setTimeout(r, 600));
+
+  const terminalsBody = await new Promise<any>((resolve, reject) => {
+    http.get(
+      {
+        host: '127.0.0.1',
+        port: fx.serverPort,
+        path: `/api/sessions/${encodeURIComponent(branch)}/terminals`,
+      },
+      (res) => {
+        let d = '';
+        res.on('data', (c) => (d += c));
+        res.on('end', () => resolve(JSON.parse(d)));
+      },
+    ).on('error', reject);
+  });
+  const claudeTab = terminalsBody.terminals.find(
+    (t: { name: string }) => t.name === 'claude',
+  );
+  expect(claudeTab).toBeTruthy();
+  expect(claudeTab.running).toBe(true);
+
+  const stateBody = await new Promise<any>((resolve, reject) => {
+    http.get(
+      { host: '127.0.0.1', port: fx.serverPort, path: '/api/state' },
+      (res) => {
+        let d = '';
+        res.on('data', (c) => (d += c));
+        res.on('end', () => resolve(JSON.parse(d)));
+      },
+    ).on('error', reject);
+  });
+  const projectPath = Object.keys(stateBody.projects)[0];
+  const session = stateBody.projects[projectPath].sessions[branch];
+  expect(['starting', 'idle', 'working']).toContain(session.lastStatus);
+  expect(session.lastStatus).not.toBe('dead');
+});
+
+test('20. mobile viewport: terminal-host gets non-zero height', async ({ browser }) => {
+  // Regression: in the mobile flex-column layout (.app { flex-direction: column })
+  // .main was missing flex:1 / min-height:0, so .terminal-host collapsed to 0px
+  // and xterm rendered onto a blank cream pane. The fix adds those rules under
+  // @media (max-width: 760px). This test loads the page at a phone width,
+  // creates a session, opens it via the mobile drawer, and asserts the
+  // terminal area has real height.
+  const ctx = await browser.newContext({ viewport: { width: 400, height: 800 } });
+  const page = await ctx.newPage();
+  try {
+    await page.goto(fx.serverUrl);
+    await page.locator('[data-testid="drawer-toggle"]').click();
+    await createSessionViaUi(page, 'feature/mobile');
+    const card = page.locator('[data-testid="session-card-feature/mobile"]');
+    await expect(card).toBeVisible({ timeout: 8000 });
+    await card.click();
+    const host = page.locator('[data-testid="terminal-host"]');
+    await expect(host).toBeVisible();
+    const box = await host.boundingBox();
+    expect(box?.height ?? 0).toBeGreaterThan(120);
+  } finally {
+    await ctx.close();
+  }
+});
+
 async function waitForLocalPort(port: number, timeoutMs = 8000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {

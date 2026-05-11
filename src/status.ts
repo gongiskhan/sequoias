@@ -3,6 +3,7 @@ import type { SessionStatus } from './types.js';
 export function statusFromHookEvent(event: string): SessionStatus | null {
   switch (event) {
     case 'UserPromptSubmit':
+    case 'PostToolUse':
       return 'working';
     case 'Stop':
       return 'idle';

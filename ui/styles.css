@@ -342,6 +342,34 @@ a:hover { text-decoration: underline; }
   justify-content: space-between;
   gap: var(--space-2);
 }
+.session-card-row-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+/* Small icon-only button used inside the session card header row.
+   Distinct from .icon-btn (which is the larger 38px rail/dialog button)
+   and .action-btn (the bigger labeled buttons in the actions row). */
+.card-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  color: var(--text-faint);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color var(--transition-fast), background var(--transition-fast), border-color var(--transition-fast);
+}
+.card-icon-btn:hover {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.card-icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .branch-name {
   font-family: var(--mono);
@@ -618,6 +646,29 @@ a:hover { text-decoration: underline; }
 .tab-icon-btn:disabled { opacity: 0.3; cursor: not-allowed; }
 .tab-start-btn { color: var(--green); }
 .tab-start-btn:hover { color: var(--green); background: var(--green-soft); }
+
+/* "+" button at the end of the tab strip — spawns an ad-hoc shell-N pty
+   at the worktree cwd. Visually it sits in line with the tabs but is
+   smaller and dim until hovered. */
+.terminal-tab-add {
+  margin-left: var(--space-1);
+  padding: 6px 9px;
+  color: var(--text-faint);
+  background: transparent;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  align-self: center;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.terminal-tab-add:hover {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-style: solid;
+  border-color: var(--accent);
+}
 
 /* =========================================================
    xterm host
@@ -958,6 +1009,14 @@ a:hover { text-decoration: underline; }
   .app {
     display: flex;
     flex-direction: column;
+  }
+  /* In the desktop grid layout the second column gives .main its height.
+     In the mobile flex column layout we have to make .main grow into the
+     remaining space below the topbar — otherwise .terminal-host collapses
+     to 0px and xterm.fit() reports 0 cols/rows (blank cream pane). */
+  .main {
+    flex: 1;
+    min-height: 0;
   }
   .rail {
     position: fixed;

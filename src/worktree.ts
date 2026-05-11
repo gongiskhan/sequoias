@@ -10,6 +10,7 @@ import {
   readMainPortMap,
   rewriteEnvFiles,
 } from './env-rewriter.js';
+import { patchFrontendDevScripts } from './package-json-patcher.js';
 import type { Session } from './types.js';
 
 export type CreateWorktreeArgs = {
@@ -85,6 +86,10 @@ export async function createWorktree(args: CreateWorktreeArgs): Promise<{
   for (const f of createdPortFiles) {
     if (!worktreeEnvFiles.includes(f)) worktreeEnvFiles.push(f);
   }
+
+  // Patch frontend package.json dev scripts to fall back to
+  // SEQUOIAS_FRONTEND_PORT when shell PORT is unset. Idempotent.
+  await patchFrontendDevScripts(targetDir);
 
   await fsp.writeFile(
     path.join(targetDir, '.sequoias-meta.json'),
@@ -189,6 +194,14 @@ export async function resyncEnvFiles(args: {
   const createdPortFiles = await ensureWorkspacePortFiles(worktreePath, ports);
   for (const f of createdPortFiles) {
     if (!mainEnvFiles.includes(f)) mainEnvFiles.push(f);
+  }
+
+  // Patch frontend package.json dev scripts on every resync. Idempotent for
+  // already-patched files; this is what brings 4-5-changes-old worktrees up
+  // to date when the user clicks "Sync env".
+  const patchedPkgs = await patchFrontendDevScripts(worktreePath);
+  for (const f of patchedPkgs) {
+    if (!copiedFiles.includes(f)) copiedFiles.push(f);
   }
 
   const mergedPorts = { ...existingPorts, ...ports };

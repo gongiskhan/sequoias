@@ -156,6 +156,7 @@ export async function loadStore(): Promise<Store> {
       if (!project) return;
       const session = project.sessions[branch];
       if (!session) return;
+      if (session.lastStatus === status) return;
       session.lastStatus = status;
       session.lastStatusAt = new Date().toISOString();
       if (hookEvent) session.lastHookEvent = hookEvent;

@@ -356,6 +356,225 @@ Cosmetic but worth flagging: `resyncEnvFiles` returns `mergedPorts = { ...existi
 
 ---
 
+## 2.10 PostToolUse hook recovers waiting → working (2026-05-08)
+
+### 2.10.1 The one-way `waiting` trap
+
+User screenshot showed a session badged **WAITING** while its `claude` terminal had been actively generating for over four minutes. The state machine had no path back: `Notification` → `waiting` was a terminal state until `Stop` fired at end-of-turn (potentially many minutes/hours later).
+
+The trigger is a permission-prompt `Notification` (e.g. Claude needs Bash approval). The hook fires when the dialog appears and flips the badge to `waiting`. The user clicks Allow, Claude resumes, but **no further hook fires until the entire turn ends with `Stop`**. The 60s pty-output fallback in `pty-manager.ts` does not help because it only decays `working → idle`, never `waiting → anything`.
+
+**Fix:** added `PostToolUse` to the injected hook set (`src/claude-hooks.ts`), mapped to `working` in `statusFromHookEvent` (`src/status.ts`). The first tool execution after a permission grant flips the badge back.
+
+**Why `PostToolUse` and not `PreToolUse`:** Claude Code's documented hook order is `PreToolUse → PermissionRequest → tool runs → PostToolUse` (https://code.claude.com/docs/en/hooks.md). `PreToolUse` fires *before* the permission dialog, so it can't be the recovery edge — the subsequent `Notification` would just clobber it. `PostToolUse` is the first signal that unambiguously fires after user approval and tool execution.
+
+**How to apply:** any future tool-permission-related status work needs to remember `PostToolUse` is the post-approval edge. If the user starts seeing `working` flicker too eagerly during a turn, the right fix is to refine the matcher (e.g. exclude specific tools), not to drop `PostToolUse`.
+
+### 2.10.2 setSessionStatus short-circuit on no-change
+
+Pairing change required by 2.10.1: `PostToolUse` fires on *every* tool call in a normal turn (often dozens). Previously `setSessionStatus` wrote state.json + broadcast a WS message on every call, regardless of whether the value changed. With three sparse hooks that didn't bite; with `PostToolUse` it would create a hot loop of disk writes + broadcasts during normal Claude work.
+
+Added `if (session.lastStatus === status) return;` at the top of `setSessionStatus` in `src/store.ts`. `lastStatusAt` and `lastHookEvent` are intentionally preserved on no-change — their semantic is "last time the status *changed*", not "last hook received".
+
+**Why bundled with the hook fix:** the two changes are mechanically independent but logically inseparable. Adding the hook without the short-circuit would noticeably increase load on every active session.
+
+**How to apply:** don't remove the short-circuit. If you ever need a "log every hook regardless of state-change" feature, route it through a separate field/event, not through `setSessionStatus`.
+
+### 2.10.3 Known follow-ups (deliberately not bundled)
+
+- **`Notification` subtype filtering.** Claude Code's `Notification` event fires with `notification_type` set to one of `permission_prompt`, `idle_prompt`, `auth_success`, `elicitation_*`, etc. Currently we map *all* `Notification` events to `waiting`, which mislabels the `idle_prompt` case (Claude reminding the user it's been idle — the session is genuinely idle, not waiting for input). Fixable by inspecting `notification_type` in the `/_hook` payload or by injecting separate matcher-tagged hooks per subtype. Different symptom than 2.10.1; deferred until it bites.
+- **`SessionStart` hook for IDE-launched sessions.** Could mark a session as `working` when an IDE-spawned Claude process attaches (currently Sequoias only knows about the sessions it spawned itself). Separate feature.
+- **JSONL-driven status inference.** Watching `~/.claude/projects/<encoded>/*.jsonl` for new assistant content would give a "currently generating" signal. Per 2.5.8 the project deliberately stayed away from heuristic classifiers — sticking with the hook-driven approach.
+
+---
+
+## 2.11 PR auto-commit, claude --continue, mobile pane fix, ad-hoc terminals (2026-05-08)
+
+Four fixes shipped together. Each is small and the interactions between them are minimal, but they all touched UI surface area, so they share a section.
+
+### 2.11.1 PR endpoint auto-commits uncommitted work
+
+**`createPullRequest` runs `git status --porcelain`; if dirty, `git add -A && git commit -m "wip: <branch>"` before pushing.**
+
+**Why:** the most common reason the PR button failed was `gh pr create` reporting "could not find any commits between origin/main and <branch>" — the user had unstaged work and no commits ahead of base. Asking the user to drop to a terminal and commit before clicking the button defeats the point of the button. The auto-commit message is intentionally generic; users who care about the message can commit by hand first and the auto-commit becomes a no-op (`status --porcelain` is empty).
+
+**How to apply:** if you ever need to gate this behind a flag, add an opt-out (`?noAutoCommit=true`), don't reverse the default. The "wip: <branch>" message is fine for a personal tool; if Sequoias ever grows team users, prompt for the message instead.
+
+### 2.11.2 `Continue` button → `claude --continue`
+
+**Per-session "Continue" icon-button in the SessionCard header row. Calls `POST /api/projects/:id/sessions/:branch/claude-continue`, which kills the current claude pty and respawns it with `cmd: 'claude --continue'`.**
+
+**Why:** users want to resume the most recent Claude session in a worktree without manually killing the tab and typing the flag. The respawn path mirrors the normal claude spawn (same TerminalConfig, only `cmd` is overridden), so all hook plumbing, status tracking, and JSONL pairing keep working.
+
+**Why the icon lives in the card header row, not the actions grid below:**
+- E2E test #14 calls `card.click()` (Playwright clicks the geometric center of the bounding box). With 4 buttons in the actions row, the center landed in the gap between buttons 2 and 3 and propagated to the card → session selected. With 5 buttons, the center sat *on* the middle button, intercepting the click. The first attempt put Continue at position 3 of 5 and broke test #14 deterministically.
+- Moving Continue out of the actions grid (small `.card-icon-btn` next to the StatusBadge in the header row) keeps the actions grid even-numbered.
+
+**How to apply:** any future "5th action" should also live outside the actions grid, OR the test should be updated to click a specific text node instead of the card center. Don't move Continue back into the actions row without re-running test #14 explicitly.
+
+**Two follow-up bugs surfaced when actually using Continue against a real Claude session (the e2e test caught neither because both were timing-dependent and only mattered with a real binary present in PATH):**
+
+#### 2.11.2a TerminalPane WebSocket doesn't auto-reconnect after server-initiated kill
+
+The kill path closes every WS attached to the pty (`for (const ws of entry.sockets) ws.close()`). The new pty has no WS until something attaches. The existing `restart` button in `Terminal.tsx` solves this by bumping `refreshKey` after the POST returns — that changes the React key on `<TerminalPane>`, forcing unmount + remount + a fresh WS connect.
+
+The Continue handler in `App.tsx` lives outside Terminal.tsx and originally did not bump `refreshKey`. Result: the user saw the *old* TerminalPane with a closed WS and stale buffer, plus "[claude] not running. Click restart to spawn it." on any reconnect attempt.
+
+**Fix:** Continue dispatches a `sequoias:remount-terminal` custom event with `{ branch, name: 'claude' }`. Terminal.tsx subscribes and runs the same `setRefreshKey` + `setMounted` dance the local `restart` button does.
+
+**Why a custom event and not just calling `restart` directly:** Terminal.tsx and the SessionCard live in different subtrees with no shared parent that owns refreshKey state. The event bus pattern is already in use (`sequoias:terminals-changed`), so this slots in cleanly.
+
+**How to apply:** any new server-side endpoint that kills + respawns a terminal must dispatch `sequoias:remount-terminal` so the UI's WS reconnects. Don't add another remount path; reuse this event.
+
+#### 2.11.2b Old pty's `onExit` clobbers the new entry after respawn
+
+`PtyManager.kill()` deletes from `byKey` synchronously and schedules SIGTERM → SIGKILL. The respawn (in the same JS tick) inserts the new entry into the same `byKey` slot. The OLD pty exits some milliseconds later and fires `onExit`, which originally did:
+
+```ts
+this.byKey.delete(key);  // deletes the NEW entry
+if (entry.terminal.name === 'claude') {
+  this.store.setSessionStatus(..., 'dead', 'pty-exit');  // overwrites 'starting'
+  this.byCwd.delete(cwd);  // removes NEW entry's cwd mapping
+}
+```
+
+So the user's UI eventually showed status 'dead' and the new pty wasn't reachable via byKey/byCwd lookups (hooks, attach, kill-by-name all broke).
+
+**Fix:** guard each shared-state mutation in `onExit` with `byKey.get(key) === entry` (and `byCwd.get(cwd) === entry`). If the slot already points at someone else, the dying entry minds its own business.
+
+**Why this didn't bite the existing `restart` button before Continue shipped:** the restart's WS reconnect happens *after* the response returns, and in practice the new attach beat the old pty's onExit handler often enough that the user-visible failure was rare. With Continue, the bug was easily reproducible because (a) `claude --continue` writes a real command into the new pty (more event-loop work), and (b) the user is paying close attention to the badge transition.
+
+**How to apply:** any future kill+respawn endpoint inherits the guard automatically — it lives in `pty-manager.ts:onExit`. If you ever rewrite `onExit`, preserve the `stillOurs` check; without it the next respawn-style feature will resurface this bug.
+
+**Test #19 covers this:** create a session, POST `/claude-continue`, sleep past the SIGTERM/onExit window, assert the claude tab is still running and `lastStatus` is not `'dead'`. The sleep is intentional — without the race-guard the test fails reliably; with it, the test passes regardless of timing.
+
+### 2.11.3 Mobile main-pane sizing (terminal pane was 0px tall on phones)
+
+**Added `.main { flex: 1; min-height: 0 }` inside `@media (max-width: 760px)`.**
+
+**Why:** the desktop layout uses a 2-column grid (`.app { display: grid; grid-template-columns: 340px 1fr; grid-template-rows: 100% }`) which gives `.main` row height automatically. The mobile layout flips to `display: flex; flex-direction: column`, but the existing `.main` declarations didn't include `flex: 1`. So in mobile, `.main` collapsed to its content height — which is zero before the terminal renders — and `.terminal-host` (which uses `flex: 1; min-height: 0` *relative to its parent*) had nothing to fill. xterm.fit() reported 0×0 cols/rows and the user saw an empty cream pane.
+
+**How to apply:** any layout that switches between `display: grid` and `display: flex` between viewports needs flex-grow rules duplicated under the flex side — grid auto-sizes children, flex doesn't. Test #19 (added in this change) loads the page at 400×800, creates a session, and asserts `terminal-host` has bounding-box height > 120px. Don't remove that test.
+
+### 2.11.4 `+` button on the tab strip → ad-hoc shell terminals
+
+**A `+` icon at the end of the terminal tab strip spawns a shell-N pty in the worktree cwd. The terminal is in-memory only — it lives in `PtyManager.byKey` but is not persisted to `Project.terminals` in state.json. On server restart, ad-hoc terminals are gone; on archive, they're killed with the rest of the session.**
+
+**Implementation:**
+- New `PtyManager.listEntriesForBranch(projectPath, branch)` returns every running entry for a branch with its TerminalConfig. The route handler uses this to merge ad-hoc entries (entries whose name isn't in `terminalsFor(project)`) into the GET /terminals response.
+- `POST /api/projects/:id/sessions/:branch/terminals/adhoc` picks the next free `shell-N` name (against both static and currently-running ephemeral) and spawns a plain-shell pty with `cmd: null`.
+- The legacy `/api/sessions/:branch/...` route gets the same handler, mirroring the rest of the route layer.
+
+**Why ephemeral, not stored:** the user wants a *one-off* shell, not a permanent named terminal — the SettingsDialog already covers the "I want this terminal every time" use case. Persisting ad-hoc entries would conflate the two and clutter the project's stored terminals over time.
+
+**How to apply:** if a future feature needs persistent ad-hoc terminals, add an explicit "save as named terminal" affordance instead of changing the default — once a terminal lives in `Project.terminals` it auto-starts on every new session, which is rarely what the user wanted at the moment they clicked `+`.
+
+---
+
+## 2.12 cwd-aware shell PORT injection (2026-05-08)
+
+### 2.12.1 The fourth round of the 4111 collision — Next.js this time
+
+User opened a session with the new `Continue` button, then ran `npm i && npm run dev` from the worktree root. cortex bound the worktree-allocated api port (correct, per 2.8). Next.js bound 3000 (wrong — collided with the main checkout's Next.js).
+
+Trace: `ekoa-app/package.json` reads `${PORT:-3000}` in its `kill-port.sh ${PORT:-3000} && next dev` line. Sequoias' env-rewriter does inject `PORT=<value>` into `ekoa-app/.env`, but **Next.js binds the dev server before loading any `.env`** — process.env.PORT is whatever the shell exported. Sequoias wasn't exporting PORT into the shell, so `${PORT:-3000}` defaulted to 3000.
+
+cortex was fine because cortex/src/index.ts imports `dotenv/config` at module load → cortex/.env's PORT gets into process.env before cortex reads it. Next.js's bind happens before that pipeline ever runs.
+
+### 2.12.2 The fix — inject PORT only for non-root cwds
+
+**`PtyManager.spawnPty` now exports `PORT=<allocated port>` into the shell env when the terminal's `cwd` basename matches a known package alias (cortex/api/backend/server, ekoa-app/app/frontend/web/ui/next, …).** Reuses `packagePortForDir` from `env-rewriter.ts` — same heuristic that already chooses the per-package `.env` PORT.
+
+**Worktree-root shells (`cwd: '.'`) deliberately get no PORT.** A polyrepo `npm run dev` orchestrator at root spawns BOTH backend (cortex) and frontend (ekoa-app) in parallel; both read `process.env.PORT`; dotenv defaults to no-overwrite — so a root-level shell PORT would override `cortex/.env` and collide with the frontend. Per-package `cwd` is the only place where a single PORT is unambiguous.
+
+**Practical workflow change for this user (and ekoa-dev specifically):** instead of one `npm run dev` from worktree root, configure two terminals in Sequoias' SettingsDialog:
+
+| Terminal name | cwd | cmd |
+|---|---|---|
+| api | `cortex` | `npm run dev` |
+| web | `ekoa-app` | `npm run dev` |
+
+Sequoias spawns each with `PORT` set correctly (api → `ports.api`, web → `ports.ui` via the alias chain). Both run in parallel without colliding. Removes the dependency on the `npm-run-all --parallel` orchestrator.
+
+**Why not also rewrite the user's package.json or root `.env`:** those are user-controlled; touching them is a category Sequoias has consistently stayed out of. Per-cwd PORT in the shell env is the smallest contract that solves the binding-before-dotenv problem for Next.js, Vite, vite preview, fastify, express defaults, etc.
+
+**How to apply:** any future port-related work that involves the user's dev command surface should respect this layering. Per-package .env injection (2.8) covers tools that read process.env after a dotenv load. Per-cwd shell PORT injection (2.12) covers tools that read process.env at process start, before any user code. If a third class appears (e.g., tools that ignore process.env entirely and read a separate config), that's a third hook — don't try to retrofit either of the existing mechanisms.
+
+### 2.12.3 SEQUOIAS_FRONTEND_PORT / SEQUOIAS_BACKEND_PORT for orchestrator workflows
+
+**Cwd-aware injection (2.12.2) only helps users who split their dev workflow into per-package terminals.** Some users keep a single root `npm run dev` orchestrator (npm-run-all parallel) that spawns BOTH backend and frontend as children of the same shell. Per-cwd doesn't apply — both children inherit the same shell env.
+
+For these users, Sequoias now also exports two convenience aliases into every spawned shell, regardless of cwd:
+
+```
+SEQUOIAS_FRONTEND_PORT   # walks the frontend alias chain → first matching port
+SEQUOIAS_BACKEND_PORT    # walks the backend alias chain → first matching port
+```
+
+The user updates ONE line in their frontend's `package.json` to fall back to this env var instead of a hardcoded default:
+
+```diff
+-"dev": "../scripts/kill-port.sh ${PORT:-3000} && rm -f .next/dev/lock && next dev --hostname 0.0.0.0"
++"dev": "../scripts/kill-port.sh ${PORT:-${SEQUOIAS_FRONTEND_PORT:-3000}} && rm -f .next/dev/lock && next dev --hostname 0.0.0.0 -p ${PORT:-${SEQUOIAS_FRONTEND_PORT:-3000}}"
+```
+
+The fallback chain is `${PORT:-${SEQUOIAS_FRONTEND_PORT:-3000}}`:
+1. If the user explicitly prefixes `PORT=…` they win (escape hatch).
+2. Else if Sequoias is running, `SEQUOIAS_FRONTEND_PORT` is set → worktree port.
+3. Else (bare shell, no Sequoias) defaults to 3000 — preserves the old behavior outside Sequoias.
+
+Cortex remains untouched. Its dev script doesn't read PORT directly — `tsx` loads `index.ts`, `index.ts` loads dotenv, dotenv reads `cortex/.env`'s PORT (Sequoias-injected per 2.8). With shell PORT still unset at root, dotenv-default no-overwrite is a non-issue. Both processes bind their correct worktree ports. No collision.
+
+**Why we didn't auto-set shell PORT at root:** because of the cortex collision detailed in 2.12.2. If we'd set `PORT=<frontend port>` at root, dotenv-default would refuse to overwrite it in cortex, cortex would bind the frontend's port, and `kill-port.sh ${PORT}` from the frontend dev script would then kill cortex right after it bound. We considered this and rejected it — the one-line user-side fallback chain is strictly safer than an automatic shell-env injection.
+
+**How to apply:** if a future repo has multiple frontends or multiple backends, the alias-first-match nature of `SEQUOIAS_FRONTEND_PORT` becomes ambiguous. The fix in that case is to use the more specific `SEQUOIAS_PORT_<NAME>` env vars instead (already exported per session, e.g. `SEQUOIAS_PORT_UI`, `SEQUOIAS_PORT_WEB`). Don't extend the convenience aliases to handle multi-frontend; reach for the typed ones.
+
+### 2.12.4 The user feedback that broke the abstraction: existing worktrees were never going to update on their own
+
+After shipping 2.12.3 the user pushed back hard: "you're making these changes only on the ekoa-dev project folder. you're not doing them on the worktrees folders." Translation, accurate: each worktree carries its own working tree (it's the whole point of `git worktree add`), so a `package.json` change in `~/dev/ekoa-dev` doesn't propagate to `~/.worktrees/ekoa-dev/<branch>/ekoa-app/package.json`. Sequoias has been rewriting `.env` files in worktrees since 2.4 but never `package.json`, so the user's existing 6 worktrees still had the old `${PORT:-3000}` line and the SEQUOIAS_FRONTEND_PORT export was useless to them.
+
+**Sequoias now patches frontend `package.json` dev scripts in the worktree as part of the existing env-rewriter pass.** New module `src/package-json-patcher.ts` walks first-level subdirs whose basename is in the frontend alias set (ekoa-app, ekoa_app, ekoa, app, frontend, web, ui, next, client), reads each `package.json`, and rewrites `${PORT:-<digit>+}` → `${PORT:-${SEQUOIAS_FRONTEND_PORT:-<digit>+}}` in any script value. Wired into both `createWorktree` (new sessions) and `resyncEnvFiles` (the "Sync env" button — that's how the 6 existing worktrees get healed: one click each).
+
+**Idempotency:** scripts that already contain `SEQUOIAS_FRONTEND_PORT` are skipped untouched. Running the patcher twice produces zero diffs the second time. Test #11 in `tests/unit/package-json-patcher.test.ts` asserts this.
+
+**Conservative scope:**
+- Only frontend-aliased dirs. Backend `cortex/package.json` is left alone — its dev script doesn't use `${PORT:-N}` anyway (cortex reads `process.env.PORT` after dotenv loads `cortex/.env`).
+- Only scripts containing the literal pattern. No-pattern packages are no-ops.
+- Malformed JSON is skipped silently rather than throwing.
+- Trailing newline preserved (npm convention).
+
+**Why we crossed the "don't modify user code" line here:** because the alternative was making the user manually edit 6 worktrees' package.json by hand, which isn't a workflow Sequoias-the-product can defend. The change is small (one fallback chain in the script string), targeted (only the literal `${PORT:-N}` pattern), and reversible (the user can `git checkout` the file back). Sequoias' working contract was already "we modify .env files in the worktree on your behalf" — extending that to the dev script in package.json for the same reason (port allocation) is a smaller leap than it looks.
+
+**Caveat the user should know:** `git status` in a fresh worktree will show `package.json` as modified. The `wip: <branch>` auto-commit in `createPullRequest` (2.11.1) will sweep this up into the user's PR. If that's undesirable, the user can `git restore <pkg>` before clicking PR — the patcher will re-apply on next `Sync env` if they need it back.
+
+**How to apply:** if a future class of patches becomes necessary (e.g., Vite's `vite.config.ts`, or some other monorepo convention), add it to `package-json-patcher.ts` rather than creating a parallel patcher. The naming should still be honest about scope — `frontend` in the function name is load-bearing.
+
+### 2.12.5 The fallback chain wasn't enough — Next.js still binds 3000 because shell parameter expansion ≠ child env
+
+After 2.12.4 the user re-ran `npm run dev` and Next.js *still* bound 3000 (then 3001 because 3000 was held by the main checkout). The patched script looked correct — `${PORT:-${SEQUOIAS_FRONTEND_PORT:-3000}}` was sitting right there in the dev script — but the bind didn't move.
+
+Root cause: shell parameter expansion in a script string only fills argv slots. `kill-port.sh ${PORT:-N}` passes the resolved value as kill-port's argument. It does NOT export `PORT` to the environment of the next command in the chain. `next dev` then runs with PORT *unset* and binds Next.js's hardcoded 3000.
+
+The kill-port substitution was solving a different problem than the bind. They share the syntax `${PORT:-…}` but the binding side is independent.
+
+**The patcher was extended in the same commit pair to also inject `-p ${PORT:-${SEQUOIAS_FRONTEND_PORT:-N}}` into bare `next dev` / `next start` / `vite dev` / `vite preview` invocations** (the tools whose CLI binds from `process.env.PORT` before any user code runs). The flag form is unambiguous — it forces the binding regardless of the shell's PORT export semantics.
+
+**Idempotency for the flag injection:** detect any `-p ` or `--port[=\s]` in the same command segment as the target tool (segment delimiters: `&&`, `||`, `;`, `|`). If present, leave the script alone — the user already chose a port explicitly. The chaining-operator boundary matters: a `-p` flag in a *later* command (e.g., a `vite preview -p 4000` after `next dev`) must not be mistaken for `next dev`'s own port flag. Test #29 in `tests/unit/package-json-patcher.test.ts` covers this edge.
+
+**Tools added:** `next dev` (default 3000), `next start` (default 3000), `vite dev` (default 5173), `vite preview` (default 4173). New tools should be added to `PORT_FLAG_TOOLS` with their hardcoded default port. Don't generalize this into a "any binary that binds a port" — the list is intentionally finite and audited.
+
+**Required steps for the user to actually see the fix on existing worktrees:**
+1. Restart Sequoias (server-side patcher + spawn-env code is loaded fresh).
+2. Click **Sync env** on each existing session card. The patcher rewrites that worktree's `package.json` files in place. Idempotent — clicking twice is fine.
+3. Open a **new** terminal in the session (either the `+` button for an ad-hoc shell, or click Restart on the claude tab). Old shells were spawned before `SEQUOIAS_FRONTEND_PORT` was being exported and won't have it. Verify with `echo $SEQUOIAS_FRONTEND_PORT` — should print the worktree's UI port.
+4. Run `npm run dev`. Both kill-port and `next dev -p` now resolve to the worktree port.
+
+If step 4 still binds 3000, the most likely cause is `SEQUOIAS_FRONTEND_PORT` being empty in the shell — the env var only appears in shells Sequoias spawned after the latest server restart. `export SEQUOIAS_FRONTEND_PORT=<port-from-UI-chip>` in the offending shell as a one-off escape hatch.
+
+The unit tests in `tests/unit/pty-env.test.ts` cover the cwd → PORT mapping for the user's actual port shape (ui/api/ekoa_streaming_allowed_origins) and the root-shell no-injection case, plus the `SEQUOIAS_FRONTEND_PORT` / `SEQUOIAS_BACKEND_PORT` alias-chain resolution. End-to-end coverage would need a real Next.js binary to bind a port; the unit tests + the existing fake-repo fixture are the contract.
+
+---
+
 ## 3. Side-quests (not Sequoias work, captured for posterity)
 
 These were mid-session distractions resolved while building Sequoias. Not part of Sequoias' core history but worth recording so future-us doesn't re-investigate.

@@ -252,6 +252,30 @@ export function registerRoutes(app: Express, deps: RoutesDeps): void {
   });
 
   app.post(
+    '/api/sessions/:branch/claude-continue',
+    (req: Request, res: Response) => {
+      const project = projectsList()[0];
+      if (!project) {
+        res.status(404).json({ error: 'no project configured' });
+        return;
+      }
+      claudeContinueHandler(project, req, res);
+    },
+  );
+
+  app.post(
+    '/api/sessions/:branch/terminals/adhoc',
+    (req: Request, res: Response) => {
+      const project = projectsList()[0];
+      if (!project) {
+        res.status(404).json({ error: 'no project configured' });
+        return;
+      }
+      adhocTerminalHandler(project, req, res);
+    },
+  );
+
+  app.post(
     '/api/sessions/:branch/terminals/:name/restart',
     (req: Request, res: Response) => {
       const project = projectsList()[0];
@@ -416,6 +440,30 @@ export function registerRoutes(app: Express, deps: RoutesDeps): void {
     },
   );
 
+  app.post(
+    '/api/projects/:id/sessions/:branch/claude-continue',
+    (req: Request, res: Response) => {
+      const project = projectFromReq(req);
+      if (!project) {
+        res.status(404).json({ error: 'project not found' });
+        return;
+      }
+      claudeContinueHandler(project, req, res);
+    },
+  );
+
+  app.post(
+    '/api/projects/:id/sessions/:branch/terminals/adhoc',
+    (req: Request, res: Response) => {
+      const project = projectFromReq(req);
+      if (!project) {
+        res.status(404).json({ error: 'project not found' });
+        return;
+      }
+      adhocTerminalHandler(project, req, res);
+    },
+  );
+
   app.get(
     '/api/projects/:id/sessions/:branch/terminals',
     (req: Request, res: Response) => {
@@ -518,12 +566,21 @@ export function registerRoutes(app: Express, deps: RoutesDeps): void {
       res.status(404).json({ error: 'session not found' });
       return;
     }
-    const running = ptyManager.listRunning(project.path, branch);
+    const staticTerminals = terminalsFor(project);
+    const staticNames = new Set(staticTerminals.map((t) => t.name));
+    const runningEntries = ptyManager.listEntriesForBranch(project.path, branch);
+    const runningSet = new Set(runningEntries.map((e) => e.name));
+    const adhocTerminals = runningEntries
+      .filter((e) => !staticNames.has(e.name))
+      .map((e) => ({ ...e.terminal, ephemeral: true as const }));
     res.json({
-      terminals: terminalsFor(project).map((t) => ({
-        ...t,
-        running: running.includes(t.name),
-      })),
+      terminals: [
+        ...staticTerminals.map((t) => ({
+          ...t,
+          running: runningSet.has(t.name),
+        })),
+        ...adhocTerminals.map((t) => ({ ...t, running: true })),
+      ],
     });
   }
 
@@ -705,5 +762,67 @@ export function registerRoutes(app: Express, deps: RoutesDeps): void {
     const name = decodeURIComponent(String(req.params.name));
     const killed = ptyManager.kill(project.path, branch, name);
     res.json({ ok: true, killed });
+  }
+
+  function claudeContinueHandler(
+    project: Project,
+    req: Request,
+    res: Response,
+  ) {
+    const branch = decodeURIComponent(String(req.params.branch));
+    const session = project.sessions[branch];
+    if (!session) {
+      res.status(404).json({ error: 'session not found' });
+      return;
+    }
+    const claudeTerminal = terminalsFor(project).find((t) => t.name === 'claude');
+    if (!claudeTerminal) {
+      res.status(500).json({ error: 'claude terminal not configured' });
+      return;
+    }
+    ptyManager.kill(project.path, branch, 'claude');
+    // The kill is async (SIGTERM → SIGKILL after 1s), but byKey was already
+    // cleared synchronously inside kill(), so spawn() can re-bind the same
+    // key immediately. Override the cmd so the new shell starts a resumed
+    // claude session instead of a fresh one.
+    ptyManager.spawn(project.path, session, {
+      ...claudeTerminal,
+      cmd: 'claude --continue',
+    });
+    res.json({ ok: true });
+  }
+
+  function adhocTerminalHandler(
+    project: Project,
+    req: Request,
+    res: Response,
+  ) {
+    const branch = decodeURIComponent(String(req.params.branch));
+    const session = project.sessions[branch];
+    if (!session) {
+      res.status(404).json({ error: 'session not found' });
+      return;
+    }
+    const taken = new Set<string>();
+    for (const t of terminalsFor(project)) taken.add(t.name);
+    for (const e of ptyManager.listEntriesForBranch(project.path, branch)) {
+      taken.add(e.name);
+    }
+    let n = 1;
+    while (taken.has(`shell-${n}`)) n += 1;
+    const name = `shell-${n}`;
+    const entry = ptyManager.spawn(project.path, session, {
+      name,
+      cwd: '.',
+      cmd: null,
+      autostart: false,
+      background: false,
+      kind: 'pty',
+    });
+    if (!entry) {
+      res.status(500).json({ error: 'failed to spawn terminal' });
+      return;
+    }
+    res.json({ ok: true, name });
   }
 }

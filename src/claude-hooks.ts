@@ -3,7 +3,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { claudeSettingsPath, sequoiasDir, settingsSnapshotMetaPath, settingsSnapshotPath } from './paths.js';
 
-const HOOK_EVENTS = ['UserPromptSubmit', 'Stop', 'Notification'] as const;
+const HOOK_EVENTS = ['UserPromptSubmit', 'Stop', 'Notification', 'PostToolUse'] as const;
 
 type HookEvent = (typeof HOOK_EVENTS)[number];
 

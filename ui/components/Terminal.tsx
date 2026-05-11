@@ -2,7 +2,7 @@ import React, { useEffect, useState, useCallback } from 'react';
 import type { Session } from '../types.js';
 import { StatusBadge } from './StatusBadge.js';
 import { TerminalPane } from './TerminalPane.js';
-import { Play, RotateCcw, Square, Eye, ExternalLink } from 'lucide-react';
+import { Play, RotateCcw, Square, Eye, ExternalLink, Plus } from 'lucide-react';
 
 type TerminalDef = {
   name: string;
@@ -45,12 +45,30 @@ export function Terminal({ session, projectId }: Props): JSX.Element {
     void refresh();
     const id = setInterval(refresh, 4000);
     const onChanged = () => void refresh();
+    const onRemount = (e: Event) => {
+      const detail = (e as CustomEvent).detail as
+        | { branch?: string; name?: string }
+        | undefined;
+      if (!detail || !detail.name) return;
+      if (detail.branch && detail.branch !== session.branch) return;
+      const name = detail.name;
+      setActive(name);
+      setRefreshKey((prev) => ({ ...prev, [name]: (prev[name] || 0) + 1 }));
+      setMounted((prev) => {
+        const next = new Set(prev);
+        next.delete(name);
+        next.add(name);
+        return next;
+      });
+    };
     window.addEventListener('sequoias:terminals-changed', onChanged);
+    window.addEventListener('sequoias:remount-terminal', onRemount as EventListener);
     return () => {
       clearInterval(id);
       window.removeEventListener('sequoias:terminals-changed', onChanged);
+      window.removeEventListener('sequoias:remount-terminal', onRemount as EventListener);
     };
-  }, [refresh]);
+  }, [refresh, session.branch]);
 
   useEffect(() => {
     setMounted((prev) => {
@@ -85,6 +103,21 @@ export function Terminal({ session, projectId }: Props): JSX.Element {
     await fetch(`${baseUrl}/terminals/${encodeURIComponent(name)}/kill`, {
       method: 'POST',
     });
+    await refresh();
+  };
+
+  const addAdhoc = async () => {
+    const res = await fetch(`${baseUrl}/terminals/adhoc`, { method: 'POST' });
+    if (!res.ok) return;
+    const body = await res.json().catch(() => ({}));
+    if (body?.name) {
+      setActive(body.name);
+      setMounted((prev) => {
+        const next = new Set(prev);
+        next.add(body.name);
+        return next;
+      });
+    }
     await refresh();
   };
 
@@ -169,6 +202,15 @@ export function Terminal({ session, projectId }: Props): JSX.Element {
             </div>
           );
         })}
+        <button
+          className="terminal-tab terminal-tab-add"
+          title="Open another shell in this worktree"
+          onClick={() => void addAdhoc()}
+          data-testid="tab-add"
+          aria-label="Add terminal"
+        >
+          <Plus size={13} />
+        </button>
       </div>
       <div className="terminal-host" data-testid="terminal-host">
         {Array.from(mounted).map((name) => {

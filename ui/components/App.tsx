@@ -254,6 +254,36 @@ export function App(): JSX.Element {
     [pushToast],
   );
 
+  const handleClaudeContinue = useCallback(
+    async (projectPath: string, branch: string) => {
+      const id = projectIdFor(projectPath);
+      const res = await fetch(
+        `/api/projects/${id}/sessions/${encodeURIComponent(branch)}/claude-continue`,
+        { method: 'POST' },
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        pushToast('error', body.error || 'claude --continue failed');
+        return;
+      }
+      setActiveProjectPath(projectPath);
+      setActiveBranch(branch);
+      setDrawerOpen(false);
+      // Force the TerminalPane for the claude tab to remount. Server-side
+      // we killed the old pty and spawned a new one with cmd 'claude --continue';
+      // the existing TerminalPane's WS was closed by the kill path and does
+      // not auto-reconnect, so without a remount the user sees a stale buffer
+      // and "[claude] not running" on next attach attempt.
+      window.dispatchEvent(
+        new CustomEvent('sequoias:remount-terminal', {
+          detail: { branch, name: 'claude' },
+        }),
+      );
+      window.dispatchEvent(new CustomEvent('sequoias:terminals-changed'));
+    },
+    [pushToast],
+  );
+
   const onSelectSession = useCallback(
     (projectPath: string, branch: string) => {
       setActiveProjectPath(projectPath);
@@ -352,6 +382,7 @@ export function App(): JSX.Element {
           onCreatePr={handleCreatePr}
           onLaunchIde={handleLaunchIde}
           onResyncEnv={handleResyncEnv}
+          onClaudeContinue={handleClaudeContinue}
         />
       </aside>
       <main className="main">

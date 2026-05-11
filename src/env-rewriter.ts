@@ -153,11 +153,51 @@ const DIR_PORT_ALIASES: Record<string, string[]> = {
 // but the workspace's dev script reads process.env.PORT (Next.js, Vite,
 // express, etc.) and falls back to a hardcoded default that collides
 // across worktrees.
+// Workspace dir names that should inherit NEXT_PUBLIC_* env vars from the
+// worktree's root .env. These are tools whose runtime reads process.env from
+// their own project dir (Next.js, Vite-with-build-time-vars, etc.) and need
+// the *_URL / *_API_URL values to point at the worktree's allocated ports
+// rather than the main checkout's defaults. Mirrors FRONTEND_DIRS in
+// package-json-patcher.ts and is a subset of DIR_PORT_ALIASES keys.
+const FRONTEND_DIR_NAMES = new Set([
+  'ekoa-app',
+  'ekoa_app',
+  'ekoa',
+  'app',
+  'frontend',
+  'web',
+  'ui',
+  'next',
+  'client',
+]);
+
+// Read the worktree-root .env (the version we just rewrote with worktree
+// port values) and extract every line that looks like a `NEXT_PUBLIC_*=…`
+// assignment. Returns empty string if the file doesn't exist.
+function readNextPublicLines(worktreeRoot: string): string {
+  const rootEnv = path.join(worktreeRoot, '.env');
+  let content: string;
+  try {
+    content = fs.readFileSync(rootEnv, 'utf8');
+  } catch {
+    return '';
+  }
+  const lines = content.split(/\r?\n/);
+  const keep: string[] = [];
+  for (const line of lines) {
+    if (/^\s*NEXT_PUBLIC_[A-Za-z0-9_]+\s*=/.test(line)) keep.push(line);
+  }
+  return keep.join('\n');
+}
+
 export async function ensureWorkspacePortFiles(
   worktreeRoot: string,
   ports: Record<string, number>,
 ): Promise<string[]> {
   const touched: string[] = [];
+  // Pull NEXT_PUBLIC_* lines from the (already-rewritten) worktree root .env
+  // once; we'll inject them into frontend workspaces below.
+  const nextPublicBlock = readNextPublicLines(worktreeRoot);
   let entries: import('node:fs').Dirent[];
   try {
     entries = fs.readdirSync(worktreeRoot, { withFileTypes: true });
@@ -172,6 +212,7 @@ export async function ensureWorkspacePortFiles(
     if (!fs.existsSync(path.join(dir, 'package.json'))) continue;
     const port = packagePortForDir(entry.name, ports);
     if (port === undefined) continue;
+    const isFrontend = FRONTEND_DIR_NAMES.has(entry.name.toLowerCase());
 
     // If the package already has an env file, we trust the main-rewriter
     // pass to handle rewrites for files that were copied from main.
@@ -185,12 +226,19 @@ export async function ensureWorkspacePortFiles(
     const target = path.join(dir, '.env');
 
     if (!dotEnv) {
+      const fePart = isFrontend && nextPublicBlock
+        ? `\n# NEXT_PUBLIC_* mirrored from root .env (Next.js only reads .env\n` +
+          `# files in its own project dir, so URLs that point at sibling\n` +
+          `# workspaces have to be duplicated here for Next.js to see them).\n` +
+          `${nextPublicBlock}\n`
+        : '';
       const content =
         `# PORT injected by Sequoias (${entry.name} workspace allocation)\n` +
         `# This package's dev script reads process.env.PORT but the upstream\n` +
         `# repo doesn't track an env file here, so Sequoias creates one to\n` +
         `# avoid cross-worktree collisions on default ports.\n` +
-        `PORT=${port}\n`;
+        `PORT=${port}\n` +
+        fePart;
       await fsp.writeFile(target, content);
       touched.push(path.posix.join(entry.name, '.env'));
       continue;
@@ -209,14 +257,32 @@ export async function ensureWorkspacePortFiles(
     const isOurs = /^# PORT injected by Sequoias/m.test(existing);
     const hasPortLine = /^PORT=/m.test(existing);
 
-    if (isOurs && hasPortLine && existing.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith('#')).length === 1) {
-      // Pure Sequoias-managed file: regenerate.
+    // The data-only line count for the "purely Sequoias-managed" check is
+    // tricky now that we may have appended NEXT_PUBLIC_* lines on a prior
+    // pass. Treat any NEXT_PUBLIC_* line as "Sequoias-managed" too.
+    const dataLines = existing
+      .split(/\r?\n/)
+      .filter((l) => l.trim() && !l.trim().startsWith('#'));
+    const onlyPortAndNextPublic = dataLines.every(
+      (l) => /^PORT=/.test(l) || /^NEXT_PUBLIC_/.test(l),
+    );
+
+    if (isOurs && hasPortLine && onlyPortAndNextPublic) {
+      // Pure Sequoias-managed file: regenerate, including any new
+      // NEXT_PUBLIC_* lines from the (rewritten) root .env.
+      const fePart = isFrontend && nextPublicBlock
+        ? `\n# NEXT_PUBLIC_* mirrored from root .env (Next.js only reads .env\n` +
+          `# files in its own project dir, so URLs that point at sibling\n` +
+          `# workspaces have to be duplicated here for Next.js to see them).\n` +
+          `${nextPublicBlock}\n`
+        : '';
       const content =
         `# PORT injected by Sequoias (${entry.name} workspace allocation)\n` +
         `# This package's dev script reads process.env.PORT but the upstream\n` +
         `# repo doesn't track an env file here, so Sequoias creates one to\n` +
         `# avoid cross-worktree collisions on default ports.\n` +
-        `PORT=${port}\n`;
+        `PORT=${port}\n` +
+        fePart;
       if (existing !== content) {
         await fsp.writeFile(target, content);
         touched.push(path.posix.join(entry.name, '.env'));
@@ -224,20 +290,31 @@ export async function ensureWorkspacePortFiles(
       continue;
     }
 
-    // Mixed file: rewrite only the PORT= line, preserve everything else.
+    // Mixed file (user-managed content): rewrite the PORT= line in place
+    // and merge any missing NEXT_PUBLIC_* lines without disturbing the
+    // user's other keys.
+    let next = existing;
     if (hasPortLine) {
-      const next = existing.replace(/^PORT=.*$/m, `PORT=${port}`);
-      if (next !== existing) {
-        await fsp.writeFile(target, next);
-        touched.push(path.posix.join(entry.name, '.env'));
-      }
+      next = next.replace(/^PORT=.*$/m, `PORT=${port}`);
     } else {
-      const next =
-        existing.endsWith('\n') ? existing : existing + '\n';
-      const appended =
-        next +
+      next = (next.endsWith('\n') ? next : next + '\n') +
         `\n# PORT injected by Sequoias (${entry.name} workspace allocation)\nPORT=${port}\n`;
-      await fsp.writeFile(target, appended);
+    }
+    if (isFrontend && nextPublicBlock) {
+      for (const line of nextPublicBlock.split(/\r?\n/)) {
+        const m = line.match(/^\s*(NEXT_PUBLIC_[A-Za-z0-9_]+)\s*=/);
+        if (!m) continue;
+        const key = m[1];
+        const re = new RegExp(`^${key}=.*$`, 'm');
+        if (re.test(next)) {
+          next = next.replace(re, line);
+        } else {
+          next = (next.endsWith('\n') ? next : next + '\n') + line + '\n';
+        }
+      }
+    }
+    if (next !== existing) {
+      await fsp.writeFile(target, next);
       touched.push(path.posix.join(entry.name, '.env'));
     }
   }

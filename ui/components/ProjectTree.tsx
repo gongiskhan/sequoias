@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, Plus, Settings as SettingsIcon } from 'lucide-react';
 import type { Project, Session, State } from '../types.js';
 import { StatusBadge } from './StatusBadge.js';
-import { Code2, GitPullRequest, RefreshCcw, Trash2 } from 'lucide-react';
+import { Code2, GitPullRequest, RefreshCcw, Trash2, History } from 'lucide-react';
 
 const STATUS_PRIORITY: Record<string, number> = {
   waiting: 0,
@@ -46,6 +46,7 @@ type Props = {
   onCreatePr: (projectPath: string, branch: string) => Promise<void>;
   onLaunchIde: (projectPath: string, branch: string) => Promise<void>;
   onResyncEnv: (projectPath: string, branch: string) => Promise<void>;
+  onClaudeContinue: (projectPath: string, branch: string) => Promise<void>;
 };
 
 export function ProjectTree({
@@ -59,6 +60,7 @@ export function ProjectTree({
   onCreatePr,
   onLaunchIde,
   onResyncEnv,
+  onClaudeContinue,
 }: Props): JSX.Element {
   const [collapsed, setCollapsed] = useState<Set<string>>(() => loadCollapsed());
 
@@ -99,6 +101,7 @@ export function ProjectTree({
           onCreatePr={onCreatePr}
           onLaunchIde={onLaunchIde}
           onResyncEnv={onResyncEnv}
+          onClaudeContinue={onClaudeContinue}
         />
       ))}
     </div>
@@ -118,6 +121,7 @@ function ProjectGroup({
   onCreatePr,
   onLaunchIde,
   onResyncEnv,
+  onClaudeContinue,
 }: Props & {
   project: Project;
   isCollapsed: boolean;
@@ -193,6 +197,7 @@ function ProjectGroup({
                 onCreatePr={onCreatePr}
                 onLaunchIde={onLaunchIde}
                 onResyncEnv={onResyncEnv}
+                onClaudeContinue={onClaudeContinue}
               />
             ))}
           </div>
@@ -211,6 +216,7 @@ function SessionCard({
   onCreatePr,
   onLaunchIde,
   onResyncEnv,
+  onClaudeContinue,
 }: {
   session: Session;
   projectPath: string;
@@ -220,6 +226,7 @@ function SessionCard({
   onCreatePr: Props['onCreatePr'];
   onLaunchIde: Props['onLaunchIde'];
   onResyncEnv: Props['onResyncEnv'];
+  onClaudeContinue: Props['onClaudeContinue'];
 }): JSX.Element {
   const [busy, setBusy] = useState(false);
 
@@ -244,7 +251,19 @@ function SessionCard({
     >
       <div className="session-card-row">
         <span className="branch-name">{session.branch}</span>
-        <StatusBadge status={session.lastStatus} />
+        <div className="session-card-row-right" onClick={stop}>
+          <button
+            className="card-icon-btn"
+            title="Restart claude with --continue (resume the most recent session in this worktree)"
+            onClick={() => guard(() => onClaudeContinue(projectPath, session.branch))}
+            data-testid={`continue-btn-${session.branch}`}
+            disabled={busy}
+            aria-label="Continue claude session"
+          >
+            <History size={13} />
+          </button>
+          <StatusBadge status={session.lastStatus} />
+        </div>
       </div>
       {session.prUrl && (
         <a

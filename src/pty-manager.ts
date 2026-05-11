@@ -8,6 +8,7 @@ import { projectIdFor, type Store } from './store.js';
 import type { Session, SessionStatus } from './types.js';
 import type { TerminalConfig, TerminalKind } from './config.js';
 import { JsonlTailer } from './jsonl-tail.js';
+import { packagePortForDir } from './env-rewriter.js';
 
 type PtyEntry = {
   kind: 'pty';
@@ -168,6 +169,36 @@ export class PtyManager {
     env['SEQUOIAS_BRANCH'] = session.branch;
     env['SEQUOIAS_TERMINAL'] = terminal.name;
 
+    // Convenience aliases derived from the same alias chains used by the
+    // env-rewriter for per-package PORT injection. Any dev script can
+    // reference these directly: e.g. `${PORT:-${SEQUOIAS_FRONTEND_PORT:-3000}}`
+    // in a Next.js dev command resolves to the worktree's UI port when
+    // running under Sequoias and falls back to 3000 otherwise.
+    const frontendPort = packagePortForDir('frontend', session.ports);
+    const backendPort = packagePortForDir('backend', session.ports);
+    if (frontendPort !== undefined) env['SEQUOIAS_FRONTEND_PORT'] = String(frontendPort);
+    if (backendPort !== undefined) env['SEQUOIAS_BACKEND_PORT'] = String(backendPort);
+
+    // cwd-aware PORT injection. When the terminal's cwd basename matches a
+    // known package alias (cortex/api/backend/server, ekoa-app/app/frontend/
+    // web/ui/next, …), export PORT to the matching allocated port. This
+    // makes `${PORT:-3000}`-style dev scripts (Next.js, Vite, etc.) bind
+    // the worktree's port without the user having to prefix every command.
+    //
+    // We deliberately DO NOT set PORT for worktree-root shells (cwd='.').
+    // A polyrepo `npm run dev` orchestrator at root spawns BOTH backend
+    // (cortex) and frontend (ekoa-app) in parallel. Both read process.env
+    // .PORT, and dotenv defaults to no-overwrite — so a root-level shell
+    // PORT would override cortex/.env's PORT and collide with ekoa-app.
+    // Per-package cwd is the only place where a single PORT is unambiguous.
+    const cwdBasename = terminalCwdBasename(terminal.cwd);
+    if (cwdBasename) {
+      const packagePort = packagePortForDir(cwdBasename, session.ports);
+      if (packagePort !== undefined) {
+        env['PORT'] = String(packagePort);
+      }
+    }
+
     const cwd = resolveCwd(session.worktreePath, terminal.cwd);
     if (!fs.existsSync(cwd)) {
       this.store.broadcast({
@@ -223,11 +254,19 @@ export class PtyManager {
     });
 
     pty.onExit(({ exitCode }) => {
-      this.byKey.delete(key);
-      if (entry.terminal.name === 'claude') {
+      // Respawn race guard: a kill+spawn (e.g. the Continue button or the
+      // restart endpoint) replaces our slot synchronously. The OLD pty's
+      // onExit fires later and would otherwise delete the NEW entry from
+      // byKey / byCwd and clobber its 'starting' status with 'dead'.
+      // Only act on shared state if we're still the current owner.
+      const stillOurs = this.byKey.get(key) === entry;
+      if (stillOurs) this.byKey.delete(key);
+      if (entry.terminal.name === 'claude' && stillOurs) {
         const status: SessionStatus = exitCode === 0 ? 'dead' : 'errored';
         this.store.setSessionStatus(projectPath, session.branch, status, 'pty-exit');
-        if (cwd === session.worktreePath) this.byCwd.delete(cwd);
+        if (cwd === session.worktreePath && this.byCwd.get(cwd) === entry) {
+          this.byCwd.delete(cwd);
+        }
       }
       this.store.broadcast({
         type: 'terminal-exit',
@@ -384,6 +423,23 @@ export class PtyManager {
     return out;
   }
 
+  // Enumerate every running entry for a branch with its full TerminalConfig.
+  // The route handler uses this to surface ad-hoc terminals (entries whose
+  // name isn't in the static `terminalsFor(project)` list) so they appear
+  // as tabs in the UI.
+  listEntriesForBranch(
+    projectPath: string,
+    branch: string,
+  ): Array<{ name: string; terminal: TerminalConfig }> {
+    const out: Array<{ name: string; terminal: TerminalConfig }> = [];
+    for (const e of this.byKey.values()) {
+      if (e.projectPath === projectPath && e.branch === branch) {
+        out.push({ name: e.terminal.name, terminal: e.terminal });
+      }
+    }
+    return out;
+  }
+
   resolveByCwd(cwd: string): PtyEntry | undefined {
     return this.byCwd.get(cwd);
   }
@@ -422,4 +478,21 @@ export function killTree(rootPid: number, signal: NodeJS.Signals): void {
 function resolveCwd(worktreePath: string, terminalCwd: string): string {
   if (path.isAbsolute(terminalCwd)) return terminalCwd;
   return path.resolve(worktreePath, terminalCwd);
+}
+
+// Pick the leaf directory name for use with packagePortForDir.
+// Returns '' when the cwd resolves to the worktree root (no package match).
+// Examples:
+//   '.'              -> ''
+//   './'             -> ''
+//   'ekoa-app'       -> 'ekoa-app'
+//   './apps/web'     -> 'web'
+//   '/abs/.../api'   -> 'api'
+export function terminalCwdBasename(terminalCwd: string | undefined): string {
+  if (!terminalCwd) return '';
+  const trimmed = terminalCwd.replace(/\/+$/, '');
+  if (trimmed === '' || trimmed === '.' || trimmed === './') return '';
+  const base = path.basename(trimmed);
+  if (base === '.' || base === '..') return '';
+  return base;
 }

@@ -11,6 +11,29 @@ export async function createPullRequest(
 ): Promise<CreatePrResult> {
   const git = simpleGit(worktreePath);
 
+  // Auto-commit any uncommitted work first. Without this, branches that are
+  // ahead of origin only via untracked/unstaged files produce
+  //   gh: could not find any commits between origin/main and <branch>
+  // which is the most common reason this endpoint fails for users who hit
+  // "PR" mid-task without manually committing.
+  try {
+    const status = await execa('git', ['status', '--porcelain'], { cwd: worktreePath });
+    const dirty = String(status.stdout).trim().length > 0;
+    if (dirty) {
+      await execa('git', ['add', '-A'], { cwd: worktreePath });
+      await execa(
+        'git',
+        ['commit', '-m', `wip: ${branch}`],
+        { cwd: worktreePath },
+      );
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      error: `auto-commit failed: ${(err as Error).message}`,
+    };
+  }
+
   try {
     const remote = await git.raw(['config', '--get', `branch.${branch}.remote`]).catch(() => '');
     const upstreamSet = remote.trim().length > 0;
